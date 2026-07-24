@@ -1,0 +1,73 @@
+import cv2
+
+
+USB_CAMERA_NUMBER = 1
+INTEGRATED_CAMERA_NUMBER = 0
+
+FRAME_WIDTH = 1280
+FRAME_HEIGHT = 720
+
+PAUSE_KEY = ord("p")
+EXIT_KEY = ord("q")
+
+
+def open_camera() -> cv2.VideoCapture | None:
+    camera = cv2.VideoCapture(USB_CAMERA_NUMBER)
+
+    if camera.isOpened():
+        print("Using USB camera.")
+        return camera
+
+    camera.release()
+
+    camera = cv2.VideoCapture(INTEGRATED_CAMERA_NUMBER)
+
+    if camera.isOpened():
+        print("Using integrated camera.")
+        return camera
+
+    camera.release()
+    return None
+
+
+def main() -> None:
+    camera = open_camera()
+
+    if camera is None:
+        print("No camera detected")
+        return
+
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+
+    paused = False
+    frame = None
+
+    try:
+        while True:
+            if not paused:
+                success, frame = camera.read()
+
+                if not success:
+                    print("Error: Could not read frame.")
+                    break
+
+            if frame is not None:
+                cv2.imshow("Camera", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == PAUSE_KEY:
+                paused = not paused
+                print("Paused" if paused else "Resumed")
+
+            if key == EXIT_KEY:
+                break
+
+    finally:
+        camera.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
