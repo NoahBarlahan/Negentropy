@@ -1,25 +1,146 @@
-import cv2
+"""Real-time hand tracking with OpenCV and MediaPipe.
+
+The program reads frames from a camera, asks MediaPipe to find the hand's
+21 landmarks, draws those landmarks, and displays an estimated confidence.
+Keyboard controls are handled inside the main camera loop near the bottom.
+"""
+
+from pathlib import Path  # Builds a model path relative to this script.
+import time  # Supplies timestamps for tracking and FPS measurements.
+
+# Keep dependency errors readable instead of showing a long import traceback.
+try:
+    import cv2
+    import mediapipe as mp
+except ModuleNotFoundError:
+    print("Hand-tracking dependencies are not installed.")
+    print("Install them with:")
+    print("python -m pip install -r requirements.txt")
+    raise SystemExit(1)
 
 
+# OpenCV identifies cameras with integer indexes. The external USB camera is
+# tried first; the built-in camera is used as a fallback.
 USB_CAMERA_NUMBER = 1
 INTEGRATED_CAMERA_NUMBER = 0
 
+# Requested camera resolution. A camera may choose the nearest supported size.
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
 
+# MediaPipe processes a smaller copy for speed. Landmarks are normalized, so
+# they can still be drawn accurately on the full-resolution display frame.
+PROCESSING_WIDTH = 640
+
+# A mirrored image behaves like a bathroom mirror and matches selfie-camera
+# handedness conventions used by MediaPipe.
+MIRROR_IMAGE = True
+
+# MediaPipe hand-model settings
+# The pretrained model file must sit beside this Python file.
+MODEL_PATH = Path(__file__).with_name("hand_landmarker.task")
+
+# Tracking one hand costs less processing power than tracking two.
+NUMBER_OF_HANDS = 1
+
+# Lower thresholds accept more uncertain hands. Higher thresholds reduce false
+# positives, but may lose a hand under poor lighting or partial obstruction.
+MINIMUM_HAND_DETECTION_CONFIDENCE = 0.30
+MINIMUM_HAND_PRESENCE_CONFIDENCE = 0.30
+MINIMUM_TRACKING_CONFIDENCE = 0.40
+
+# Temporal confidence estimate
+# MediaPipe's high-level result does not expose its raw presence probability.
+# These values therefore create a separate, easy-to-read temporal estimate:
+# repeated detections raise confidence and repeated misses lower confidence.
+DETECTED_CONFIDENCE_GAIN = 0.12
+MISSING_CONFIDENCE_LOSS = 0.10
+LOW_CONFIDENCE_LIMIT = 0.45
+HIGH_CONFIDENCE_LIMIT = 0.75
+
+# Drawing settings
+# OpenCV colors use BGR order rather than the more common RGB order.
+HAND_COLOR = (0, 255, 0)
+JOINT_COLOR = (0, 255, 0)
+FINGERTIP_COLOR = (0, 165, 255)
+WRIST_COLOR = (255, 255, 0)
+TEXT_COLOR = (0, 255, 0)
+WARNING_COLOR = (0, 165, 255)
+CONNECTION_THICKNESS = 2
+JOINT_RADIUS = 4
+FINGERTIP_RADIUS = 7
+WRIST_RADIUS = 9
+
+# Controls
+# ord() converts a character into the numeric key code returned by waitKey().
 PAUSE_KEY = ord("p")
 EXIT_KEY = ord("q")
+LANDMARK_KEY = ord("l")
+
+# MediaPipe landmark numbers:
+# 0 is the wrist; each finger then has four landmarks.
+# Landmark 0 is the wrist. Landmarks 4, 8, 12, 16, and 20 are the tips of the
+# thumb, index finger, middle finger, ring finger, and pinky.
+WRIST_LANDMARK = 0
+FINGERTIP_LANDMARKS = {4, 8, 12, 16, 20}
+
+# Every pair tells OpenCV which landmark dots should be joined by a line.
+# Together the pairs draw the palm and the five finger skeletons.
+HAND_CONNECTIONS = (
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 4),
+    (0, 5),
+    (5, 6),
+    (6, 7),
+    (7, 8),
+    (5, 9),
+    (9, 10),
+    (10, 11),
+    (11, 12),
+    (9, 13),
+    (13, 14),
+    (14, 15),
+    (15, 16),
+    (13, 17),
+    (17, 18),
+    (18, 19),
+    (19, 20),
+    (0, 17),
+)
+
+
+def print_controls() -> None:
+    """Print keyboard controls and landmark colors in the terminal."""
+
+    print()
+    print("MEDIAPIPE HAND TRACKER")
+    print("--------------------------------")
+    print("L       Show or hide landmarks")
+    print("P       Pause or resume")
+    print("Q       Quit")
+    print("--------------------------------")
+    print("Green dots: finger joints")
+    print("Orange dots: fingertips")
+    print("Cyan dot: wrist / base of hand")
+    print()
 
 
 def open_camera() -> cv2.VideoCapture | None:
+    """Open the USB camera, falling back to the integrated camera."""
+
+    # Try the preferred external camera first.
     camera = cv2.VideoCapture(USB_CAMERA_NUMBER)
 
     if camera.isOpened():
         print("Using USB camera.")
         return camera
 
+    # Release a failed camera handle before trying another device.
     camera.release()
 
+    # Try the built-in camera only when the USB camera was unavailable.
     camera = cv2.VideoCapture(INTEGRATED_CAMERA_NUMBER)
 
     if camera.isOpened():
@@ -30,44 +151,318 @@ def open_camera() -> cv2.VideoCapture | None:
     return None
 
 
+def create_hand_landmarker():
+    """Load the pretrained model and configure MediaPipe video tracking."""
+
+    # Fail early with a useful path when the downloaded model is missing.
+    if not MODEL_PATH.exists():
+        print(f"Hand model not found: {MODEL_PATH}")
+        print("Download hand_landmarker.task before running the program.")
+        raise SystemExit(1)
+
+    # BaseOptions tells MediaPipe which pretrained model file to load.
+    base_options = mp.tasks.BaseOptions(model_asset_path=str(MODEL_PATH))
+
+    # VIDEO mode lets MediaPipe reuse tracking information between frames. It
+    # is faster and steadier than treating every camera frame as a new photo.
+    options = mp.tasks.vision.HandLandmarkerOptions(
+        base_options=base_options,
+        running_mode=mp.tasks.vision.RunningMode.VIDEO,
+        num_hands=NUMBER_OF_HANDS,
+        min_hand_detection_confidence=MINIMUM_HAND_DETECTION_CONFIDENCE,
+        min_hand_presence_confidence=MINIMUM_HAND_PRESENCE_CONFIDENCE,
+        min_tracking_confidence=MINIMUM_TRACKING_CONFIDENCE,
+    )
+
+    return mp.tasks.vision.HandLandmarker.create_from_options(options)
+
+
+def prepare_for_mediapipe(frame):
+    """Resize an OpenCV frame and convert it into a MediaPipe image."""
+
+    # Calculate a smaller height that preserves the original aspect ratio.
+    frame_height, frame_width = frame.shape[:2]
+    processing_height = round(frame_height * PROCESSING_WIDTH / frame_width)
+
+    # INTER_AREA is a good interpolation method when shrinking an image.
+    smaller_frame = cv2.resize(
+        frame,
+        (PROCESSING_WIDTH, processing_height),
+        interpolation=cv2.INTER_AREA,
+    )
+    # OpenCV supplies BGR pixels, while MediaPipe expects RGB pixels.
+    rgb_frame = cv2.cvtColor(smaller_frame, cv2.COLOR_BGR2RGB)
+    return mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+
+
+def normalized_to_pixel(landmark, width: int, height: int) -> tuple[int, int]:
+    """Convert a normalized MediaPipe coordinate into a screen pixel."""
+
+    # MediaPipe coordinates normally range from 0.0 to 1.0. Clamp them so a
+    # slightly out-of-frame prediction cannot create an invalid draw position.
+    x = min(max(landmark.x, 0.0), 1.0)
+    y = min(max(landmark.y, 0.0), 1.0)
+    return int(x * width), int(y * height)
+
+
+def draw_hand_landmarks(frame, hand_landmarks) -> None:
+    """Draw the hand skeleton, wrist, joints, and fingertips on a frame."""
+
+    height, width = frame.shape[:2]
+
+    # Convert all 21 normalized landmarks once before drawing them.
+    points = [
+        normalized_to_pixel(landmark, width, height)
+        for landmark in hand_landmarks
+    ]
+
+    # Draw connecting bones first so the dots appear cleanly on top.
+    for start_index, end_index in HAND_CONNECTIONS:
+        cv2.line(
+            frame,
+            points[start_index],
+            points[end_index],
+            HAND_COLOR,
+            CONNECTION_THICKNESS,
+            cv2.LINE_AA,
+        )
+
+    # Give the wrist, fingertips, and regular joints different appearances.
+    for index, point in enumerate(points):
+        if index == WRIST_LANDMARK:
+            color = WRIST_COLOR
+            radius = WRIST_RADIUS
+        elif index in FINGERTIP_LANDMARKS:
+            color = FINGERTIP_COLOR
+            radius = FINGERTIP_RADIUS
+        else:
+            color = JOINT_COLOR
+            radius = JOINT_RADIUS
+
+        cv2.circle(frame, point, radius, color, -1, cv2.LINE_AA)
+
+
+def update_temporal_confidence(
+    previous_confidence: float,
+    hand_detected: bool,
+) -> float:
+    """Raise confidence after detections and lower it after missed frames."""
+
+    # min() and max() keep the estimate within the valid 0.0-to-1.0 range.
+    if hand_detected:
+        return min(1.0, previous_confidence + DETECTED_CONFIDENCE_GAIN)
+
+    return max(0.0, previous_confidence - MISSING_CONFIDENCE_LOSS)
+
+
+def confidence_description(confidence: float) -> str:
+    """Translate a numeric confidence estimate into LOW, MEDIUM, or HIGH."""
+
+    if confidence < LOW_CONFIDENCE_LIMIT:
+        return "LOW"
+
+    if confidence < HIGH_CONFIDENCE_LIMIT:
+        return "MEDIUM"
+
+    return "HIGH"
+
+
+def draw_status(
+    frame,
+    hand_detected: bool,
+    hand_confidence: float,
+    handedness: str,
+    fps: float,
+) -> None:
+    """Draw detection state, estimated confidence, and FPS on the image."""
+
+    # The two state estimates are complements and always add up to 100%.
+    no_hand_confidence = 1.0 - hand_confidence
+
+    if hand_detected:
+        description = confidence_description(hand_confidence)
+        status = (
+            f"HAND DETECTED ({handedness})  "
+            f"Estimated confidence: {hand_confidence:.0%} {description}"
+        )
+        color = TEXT_COLOR
+    else:
+        status = (
+            f"NO HAND DETECTED  "
+            f"Estimated no-hand confidence: {no_hand_confidence:.0%}"
+        )
+        color = WARNING_COLOR
+
+    # First line: current hand/no-hand state and confidence estimate.
+    cv2.putText(
+        frame,
+        status,
+        (20, 35),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.68,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+    # Second line: smoothed processing speed.
+    cv2.putText(
+        frame,
+        f"FPS: {fps:.1f}",
+        (20, 68),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+
+
 def main() -> None:
+    """Run the camera, detection, drawing, and keyboard-control loop."""
+
+    # Camera setup ---------------------------------------------------------
     camera = open_camera()
 
     if camera is None:
-        print("No camera detected")
+        print("No camera detected.")
         return
 
+    # Ask the camera for the desired resolution. Not every camera guarantees
+    # that it will provide the exact requested values.
     camera.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     camera.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
+    print_controls()
+
+    # Runtime state --------------------------------------------------------
     paused = False
+    show_landmarks = True
     frame = None
+    latest_result = None
+    hand_confidence = 0.0
+    last_timestamp_ms = 0
+    # perf_counter() is a precise clock suitable for measuring frame speed.
+    previous_frame_time = time.perf_counter()
+    smoothed_fps = 0.0
 
     try:
-        while True:
-            if not paused:
-                success, frame = camera.read()
+        # The context manager automatically closes MediaPipe when the loop ends.
+        with create_hand_landmarker() as landmarker:
+            while True:
+                # Do not read or process a new frame while paused. The most
+                # recent frame remains displayed so keyboard input still works.
+                if not paused:
+                    success, frame = camera.read()
 
-                if not success:
-                    print("Error: Could not read frame.")
+                    if not success:
+                        print("Error: Could not read frame.")
+                        break
+
+                    # Flip before detection so landmarks and handedness match
+                    # exactly what the user sees in the window.
+                    if MIRROR_IMAGE:
+                        frame = cv2.flip(frame, 1)
+
+                    # Create the smaller RGB image used only for inference.
+                    mediapipe_image = prepare_for_mediapipe(frame)
+
+                    # VIDEO mode requires strictly increasing millisecond
+                    # timestamps. max() prevents duplicate timestamps when the
+                    # loop processes more than one frame within a millisecond.
+                    timestamp_ms = max(
+                        last_timestamp_ms + 1,
+                        int(time.monotonic() * 1000),
+                    )
+                    last_timestamp_ms = timestamp_ms
+
+                    # The result contains handedness plus 21 normalized
+                    # landmarks for every hand that passed the model thresholds.
+                    latest_result = landmarker.detect_for_video(
+                        mediapipe_image,
+                        timestamp_ms,
+                    )
+
+                    # An empty landmark list means no hand passed the thresholds.
+                    hand_detected = bool(latest_result.hand_landmarks)
+                    hand_confidence = update_temporal_confidence(
+                        hand_confidence,
+                        hand_detected,
+                    )
+
+                    # Measure processing speed for this iteration.
+                    current_frame_time = time.perf_counter()
+                    elapsed = current_frame_time - previous_frame_time
+                    previous_frame_time = current_frame_time
+
+                    if elapsed > 0:
+                        current_fps = 1.0 / elapsed
+                        if smoothed_fps == 0.0:
+                            smoothed_fps = current_fps
+                        else:
+                            # Exponential smoothing prevents the displayed FPS
+                            # from jumping sharply on every individual frame.
+                            smoothed_fps = (
+                                0.90 * smoothed_fps + 0.10 * current_fps
+                            )
+
+                # Display --------------------------------------------------
+                if frame is not None:
+                    # Draw on a copy so the original camera frame stays clean.
+                    display_frame = frame.copy()
+                    hand_detected = bool(
+                        latest_result and latest_result.hand_landmarks
+                    )
+                    handedness = "UNKNOWN"
+
+                    if hand_detected:
+                        # MediaPipe returns a classification such as Left or
+                        # Right. The input is mirrored as MediaPipe expects.
+                        if latest_result.handedness:
+                            handedness = (
+                                latest_result.handedness[0][0].category_name
+                            ).upper()
+
+                        # The landmark result is a list so this also works if
+                        # NUMBER_OF_HANDS is increased later.
+                        if show_landmarks:
+                            for landmarks in latest_result.hand_landmarks:
+                                draw_hand_landmarks(display_frame, landmarks)
+
+                    draw_status(
+                        display_frame,
+                        hand_detected,
+                        hand_confidence,
+                        handedness,
+                        smoothed_fps,
+                    )
+                    cv2.imshow("MediaPipe Hand Tracker", display_frame)
+
+                # Keyboard controls ---------------------------------------
+                # waitKey also allows OpenCV to refresh the camera window.
+                key = cv2.waitKey(1) & 0xFF
+
+                if key == PAUSE_KEY:
+                    paused = not paused
+                    print("Paused." if paused else "Resumed.")
+
+                elif key == LANDMARK_KEY:
+                    show_landmarks = not show_landmarks
+                    print(
+                        "Landmarks shown."
+                        if show_landmarks
+                        else "Landmarks hidden."
+                    )
+
+                elif key == EXIT_KEY:
                     break
 
-            if frame is not None:
-                cv2.imshow("Camera", frame)
-
-            key = cv2.waitKey(1) & 0xFF
-
-            if key == PAUSE_KEY:
-                paused = not paused
-                print("Paused" if paused else "Resumed")
-
-            if key == EXIT_KEY:
-                break
-
     finally:
+        # This always runs, even after a camera/model error or Ctrl+C.
         camera.release()
         cv2.destroyAllWindows()
 
 
+# Run main() only when this file is launched directly. Importing the file from
+# a test or another program will define its functions without opening a camera.
 if __name__ == "__main__":
     main()

@@ -1,0 +1,16 @@
+# Local Python environment (recreated from requirements.txt)
+.venv/
+
+# Python-generated cache files
+__pycache__/
+*.py[cod]
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Previous experiments and local backup copies
+FastSAM-s.pt
+InitialCameraDebug.*backup*
