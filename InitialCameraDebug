@@ -1,10 +1,13 @@
 """Real-time hand tracking with OpenCV and MediaPipe.
 
 The program reads frames from a camera, asks MediaPipe to find the hand's
-21 landmarks, draws those landmarks, and displays an estimated confidence.
+21 landmarks, recognizes open-hand and fist gestures, and records timed CSV data.
 Keyboard controls are handled inside the main camera loop near the bottom.
 """
 
+import csv  # Writes time-based hand observations to spreadsheet-ready files.
+import math  # Used to calculate finger-joint angles.
+from datetime import datetime  # Creates unique, readable CSV filenames.
 from pathlib import Path  # Builds a model path relative to this script.
 import time  # Supplies timestamps for tracking and FPS measurements.
 
@@ -49,14 +52,23 @@ MINIMUM_HAND_DETECTION_CONFIDENCE = 0.30
 MINIMUM_HAND_PRESENCE_CONFIDENCE = 0.30
 MINIMUM_TRACKING_CONFIDENCE = 0.40
 
-# Temporal confidence estimate
-# MediaPipe's high-level result does not expose its raw presence probability.
-# These values therefore create a separate, easy-to-read temporal estimate:
-# repeated detections raise confidence and repeated misses lower confidence.
-DETECTED_CONFIDENCE_GAIN = 0.12
-MISSING_CONFIDENCE_LOSS = 0.10
-LOW_CONFIDENCE_LIMIT = 0.45
-HIGH_CONFIDENCE_LIMIT = 0.75
+# Gesture settings
+# A gesture must remain unchanged for this long before it is accepted. This
+# prevents one uncertain frame from rapidly switching the displayed gesture.
+GESTURE_CONFIRMATION_SECONDS = 0.50
+
+# A straight finger creates an angle near 180 degrees at its middle joint.
+# A curled finger creates a much smaller angle. The thumb is not required for
+# classification because its natural direction varies more between people.
+EXTENDED_FINGER_ANGLE = 150.0
+CURLED_FINGER_ANGLE = 115.0
+OPEN_HAND_MINIMUM_EXTENDED_FINGERS = 3
+FIST_MAXIMUM_EXTENDED_FINGERS = 1
+
+# CSV data-recording settings
+# A sample is written four times per second while recording is active.
+CSV_SAMPLE_INTERVAL_SECONDS = 0.25
+CSV_OUTPUT_DIRECTORY = Path(__file__).with_name("hand_tracking_data")
 
 # Drawing settings
 # OpenCV colors use BGR order rather than the more common RGB order.
@@ -76,6 +88,8 @@ WRIST_RADIUS = 9
 PAUSE_KEY = ord("p")
 EXIT_KEY = ord("q")
 LANDMARK_KEY = ord("l")
+START_RECORDING_KEY = ord("r")
+STOP_RECORDING_KEY = ord("s")
 
 # MediaPipe landmark numbers:
 # 0 is the wrist; each finger then has four landmarks.
@@ -83,6 +97,16 @@ LANDMARK_KEY = ord("l")
 # thumb, index finger, middle finger, ring finger, and pinky.
 WRIST_LANDMARK = 0
 FINGERTIP_LANDMARKS = {4, 8, 12, 16, 20}
+
+# Each tuple is (base joint, middle joint, fingertip). The angle at the middle
+# joint indicates whether that finger is extended or curled. Thumb landmarks
+# are deliberately excluded for better tolerance of different hand anatomy.
+FINGER_ANGLE_LANDMARKS = (
+    (5, 6, 8),    # Index finger
+    (9, 10, 12),  # Middle finger
+    (13, 14, 16), # Ring finger
+    (17, 18, 20), # Pinky
+)
 
 # Every pair tells OpenCV which landmark dots should be joined by a line.
 # Together the pairs draw the palm and the five finger skeletons.
@@ -119,6 +143,8 @@ def print_controls() -> None:
     print("--------------------------------")
     print("L       Show or hide landmarks")
     print("P       Pause or resume")
+    print("R       Start recording hand data to CSV")
+    print("S       Stop recording hand data")
     print("Q       Quit")
     print("--------------------------------")
     print("Green dots: finger joints")
@@ -242,58 +268,213 @@ def draw_hand_landmarks(frame, hand_landmarks) -> None:
         cv2.circle(frame, point, radius, color, -1, cv2.LINE_AA)
 
 
-def update_temporal_confidence(
-    previous_confidence: float,
-    hand_detected: bool,
-) -> float:
-    """Raise confidence after detections and lower it after missed frames."""
+def joint_angle(first, middle, last) -> float:
+    """Return the 3D angle at the middle landmark in degrees."""
 
-    # min() and max() keep the estimate within the valid 0.0-to-1.0 range.
-    if hand_detected:
-        return min(1.0, previous_confidence + DETECTED_CONFIDENCE_GAIN)
+    first_vector = (
+        first.x - middle.x,
+        first.y - middle.y,
+        first.z - middle.z,
+    )
+    last_vector = (
+        last.x - middle.x,
+        last.y - middle.y,
+        last.z - middle.z,
+    )
 
-    return max(0.0, previous_confidence - MISSING_CONFIDENCE_LOSS)
+    dot_product = sum(
+        first_value * last_value
+        for first_value, last_value in zip(first_vector, last_vector)
+    )
+    first_length = math.sqrt(sum(value * value for value in first_vector))
+    last_length = math.sqrt(sum(value * value for value in last_vector))
+
+    if first_length == 0.0 or last_length == 0.0:
+        return 0.0
+
+    cosine = dot_product / (first_length * last_length)
+    cosine = min(1.0, max(-1.0, cosine))
+    return math.degrees(math.acos(cosine))
 
 
-def confidence_description(confidence: float) -> str:
-    """Translate a numeric confidence estimate into LOW, MEDIUM, or HIGH."""
+def classify_hand_gesture(hand_landmarks) -> str:
+    """Classify four finger-joint angles as OPEN, FIST, or UNKNOWN."""
 
-    if confidence < LOW_CONFIDENCE_LIMIT:
-        return "LOW"
+    angles = [
+        joint_angle(
+            hand_landmarks[base_index],
+            hand_landmarks[middle_index],
+            hand_landmarks[tip_index],
+        )
+        for base_index, middle_index, tip_index in FINGER_ANGLE_LANDMARKS
+    ]
+    extended_fingers = sum(
+        angle >= EXTENDED_FINGER_ANGLE for angle in angles
+    )
+    average_angle = sum(angles) / len(angles)
 
-    if confidence < HIGH_CONFIDENCE_LIMIT:
-        return "MEDIUM"
+    if extended_fingers >= OPEN_HAND_MINIMUM_EXTENDED_FINGERS:
+        return "OPEN"
 
-    return "HIGH"
+    if (
+        extended_fingers <= FIST_MAXIMUM_EXTENDED_FINGERS
+        and average_angle <= CURLED_FINGER_ANGLE
+    ):
+        return "FIST"
+
+    return "UNKNOWN"
+
+
+def update_gesture_state(
+    raw_gesture: str,
+    candidate_gesture: str,
+    candidate_since: float,
+    current_time: float,
+) -> tuple[str, float, str | None]:
+    """Confirm a gesture only after it remains stable for half a second."""
+
+    if raw_gesture != candidate_gesture:
+        return raw_gesture, current_time, None
+
+    if (
+        raw_gesture in {"OPEN", "FIST"}
+        and current_time - candidate_since >= GESTURE_CONFIRMATION_SECONDS
+    ):
+        return candidate_gesture, candidate_since, raw_gesture
+
+    return candidate_gesture, candidate_since, None
+
+
+class HandDataRecorder:
+    """Create a CSV session and sample the latest hand state every 0.25 seconds."""
+
+    def __init__(self) -> None:
+        self.file = None
+        self.writer = None
+        self.output_path = None
+        self.started_at = 0.0
+        self.next_sample_at = 0.0
+        self.sample_number = 0
+
+    @property
+    def is_recording(self) -> bool:
+        """Return True while a CSV file is open for data collection."""
+
+        return self.file is not None
+
+    def start(self) -> None:
+        """Open a new timestamped CSV file and write its column headings."""
+
+        if self.is_recording:
+            print(f"Data recording is already active: {self.output_path}")
+            return
+
+        CSV_OUTPUT_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        filename = datetime.now().strftime(
+            "hand_tracking_%Y%m%d_%H%M%S_%f.csv"
+        )
+        self.output_path = CSV_OUTPUT_DIRECTORY / filename
+        self.file = self.output_path.open("w", newline="", encoding="utf-8")
+        self.writer = csv.writer(self.file)
+        self.writer.writerow(
+            [
+                "sample_number",
+                "elapsed_seconds",
+                "hand_detected",
+                "hand_position",
+                "hand_open",
+                "hand_fist",
+            ]
+        )
+        self.file.flush()
+
+        self.started_at = time.monotonic()
+        self.next_sample_at = self.started_at
+        self.sample_number = 0
+        print(f"Started recording hand data: {self.output_path}")
+
+    def record_if_due(
+        self,
+        current_time: float,
+        hand_detected: bool,
+        confirmed_gesture: str | None,
+    ) -> None:
+        """Write all 0.25-second samples that are due at the current time."""
+
+        if not self.is_recording:
+            return
+
+        position = confirmed_gesture if hand_detected else "NONE"
+
+        if hand_detected and position is None:
+            position = "UNKNOWN"
+
+        while current_time >= self.next_sample_at:
+            elapsed_seconds = (
+                self.sample_number * CSV_SAMPLE_INTERVAL_SECONDS
+            )
+            self.writer.writerow(
+                [
+                    self.sample_number,
+                    f"{elapsed_seconds:.2f}",
+                    "YES" if hand_detected else "NO",
+                    position,
+                    "YES" if position == "OPEN" else "NO",
+                    "YES" if position == "FIST" else "NO",
+                ]
+            )
+            self.sample_number += 1
+            self.next_sample_at = (
+                self.started_at
+                + self.sample_number * CSV_SAMPLE_INTERVAL_SECONDS
+            )
+
+        # Flush every update so collected data survives an unexpected shutdown.
+        self.file.flush()
+
+    def stop(self) -> None:
+        """Flush and close the active CSV session."""
+
+        if not self.is_recording:
+            print("Data recording is not active.")
+            return
+
+        output_path = self.output_path
+        row_count = self.sample_number
+        self.file.flush()
+        self.file.close()
+        self.file = None
+        self.writer = None
+        self.output_path = None
+        print(f"Stopped recording. Saved {row_count} rows to: {output_path}")
 
 
 def draw_status(
     frame,
     hand_detected: bool,
-    hand_confidence: float,
     handedness: str,
+    raw_gesture: str,
+    confirmed_gesture: str | None,
+    recorder: HandDataRecorder,
     fps: float,
 ) -> None:
-    """Draw detection state, estimated confidence, and FPS on the image."""
-
-    # The two state estimates are complements and always add up to 100%.
-    no_hand_confidence = 1.0 - hand_confidence
+    """Draw hand state, gesture state, recording state, and FPS."""
 
     if hand_detected:
-        description = confidence_description(hand_confidence)
-        status = (
-            f"HAND DETECTED ({handedness})  "
-            f"Estimated confidence: {hand_confidence:.0%} {description}"
-        )
+        if confirmed_gesture is not None:
+            gesture_text = confirmed_gesture
+        elif raw_gesture in {"OPEN", "FIST"}:
+            gesture_text = f"CHECKING {raw_gesture}..."
+        else:
+            gesture_text = "UNKNOWN POSITION"
+
+        status = f"HAND DETECTED ({handedness})  GESTURE: {gesture_text}"
         color = TEXT_COLOR
     else:
-        status = (
-            f"NO HAND DETECTED  "
-            f"Estimated no-hand confidence: {no_hand_confidence:.0%}"
-        )
+        status = "NO HAND DETECTED"
         color = WARNING_COLOR
 
-    # First line: current hand/no-hand state and confidence estimate.
+    # First line: current hand and gesture state.
     cv2.putText(
         frame,
         status,
@@ -304,11 +485,30 @@ def draw_status(
         2,
         cv2.LINE_AA,
     )
-    # Second line: smoothed processing speed.
+    recording_status = (
+        f"RECORDING CSV - {recorder.sample_number} samples"
+        if recorder.is_recording
+        else "CSV NOT RECORDING - press R to start"
+    )
+    recording_color = (0, 0, 255) if recorder.is_recording else color
+
+    # Second line: CSV recording state.
+    cv2.putText(
+        frame,
+        recording_status,
+        (20, 68),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        recording_color,
+        2,
+        cv2.LINE_AA,
+    )
+
+    # Third line: smoothed processing speed.
     cv2.putText(
         frame,
         f"FPS: {fps:.1f}",
-        (20, 68),
+        (20, 101),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.62,
         color,
@@ -339,7 +539,12 @@ def main() -> None:
     show_landmarks = True
     frame = None
     latest_result = None
-    hand_confidence = 0.0
+    hand_detected = False
+    raw_gesture = "UNKNOWN"
+    candidate_gesture = "UNKNOWN"
+    candidate_since = time.monotonic()
+    confirmed_gesture = None
+    recorder = HandDataRecorder()
     last_timestamp_ms = 0
     # perf_counter() is a precise clock suitable for measuring frame speed.
     previous_frame_time = time.perf_counter()
@@ -384,15 +589,33 @@ def main() -> None:
 
                     # An empty landmark list means no hand passed the thresholds.
                     hand_detected = bool(latest_result.hand_landmarks)
-                    hand_confidence = update_temporal_confidence(
-                        hand_confidence,
-                        hand_detected,
-                    )
 
                     # Measure processing speed for this iteration.
                     current_frame_time = time.perf_counter()
                     elapsed = current_frame_time - previous_frame_time
                     previous_frame_time = current_frame_time
+
+                    if hand_detected:
+                        hand_landmarks = latest_result.hand_landmarks[0]
+                        raw_gesture = classify_hand_gesture(hand_landmarks)
+                        gesture_time = time.monotonic()
+                        (
+                            candidate_gesture,
+                            candidate_since,
+                            confirmed_gesture,
+                        ) = update_gesture_state(
+                            raw_gesture,
+                            candidate_gesture,
+                            candidate_since,
+                            gesture_time,
+                        )
+
+                    else:
+                        # Reset gesture confirmation when the hand leaves.
+                        raw_gesture = "UNKNOWN"
+                        candidate_gesture = "UNKNOWN"
+                        candidate_since = time.monotonic()
+                        confirmed_gesture = None
 
                     if elapsed > 0:
                         current_fps = 1.0 / elapsed
@@ -404,6 +627,14 @@ def main() -> None:
                             smoothed_fps = (
                                 0.90 * smoothed_fps + 0.10 * current_fps
                             )
+
+                # The recorder uses its own clock, so CSV rows stay spaced at
+                # 0.25 seconds even though camera FPS varies.
+                recorder.record_if_due(
+                    time.monotonic(),
+                    hand_detected,
+                    confirmed_gesture,
+                )
 
                 # Display --------------------------------------------------
                 if frame is not None:
@@ -431,8 +662,10 @@ def main() -> None:
                     draw_status(
                         display_frame,
                         hand_detected,
-                        hand_confidence,
                         handedness,
+                        raw_gesture,
+                        confirmed_gesture,
+                        recorder,
                         smoothed_fps,
                     )
                     cv2.imshow("MediaPipe Hand Tracker", display_frame)
@@ -453,11 +686,19 @@ def main() -> None:
                         else "Landmarks hidden."
                     )
 
+                elif key == START_RECORDING_KEY:
+                    recorder.start()
+
+                elif key == STOP_RECORDING_KEY:
+                    recorder.stop()
+
                 elif key == EXIT_KEY:
                     break
 
     finally:
         # This always runs, even after a camera/model error or Ctrl+C.
+        if recorder.is_recording:
+            recorder.stop()
         camera.release()
         cv2.destroyAllWindows()
 

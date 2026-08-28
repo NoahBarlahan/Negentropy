@@ -1,181 +1,216 @@
-# Negentropy
+# Personal VLA Cinematography and Sports-Coaching Robot
 
-Negentropy is a personal cinematography robot project. Its long-term purpose is
-to autonomously understand a filming request, follow a subject, frame the shot,
-record complete activities, and analyze athletic movement.
+## Project goal
 
-This release is the completed **real-time hand-tracking prototype**. It provides
-the first lightweight perception component for the larger Smart Fixed Camera
-phase of the project.
+The goal of this project is to build a personal robot that can understand
+spoken filming instructions, locate and follow a person, control a camera,
+record activities, analyze athletic performance, and provide useful feedback.
 
-## Current product
+An example final command is:
 
-The application opens a live camera feed and uses Google's pretrained MediaPipe
-Hand Landmarker to detect and track a human hand against changing backgrounds.
-It does not use background subtraction, color matching, or a manually defined
-hand shape.
+> “Follow me, record my next ollie, keep me in frame, rate it, and tell me what
+> to improve.”
 
-Current capabilities:
+The finished robot will combine mechanical design, embedded electronics,
+computer vision, feedback control, machine learning, and a
+Vision-Language-Action (VLA) system.
 
-- Tries the USB camera first and falls back to the integrated camera.
-- Mirrors the video for a natural selfie-style view.
-- Processes a smaller image internally to maintain a high frame rate.
-- Detects and tracks one hand using a pretrained visual model.
-- Tracks 21 landmarks across the wrist, palm, joints, and fingertips.
-- Draws green hand connections and joint markers.
-- Draws orange fingertip markers and a cyan wrist marker.
-- Reports whether MediaPipe classified the hand as left or right.
-- Displays estimated hand/no-hand confidence and current FPS.
-- Allows landmark visibility and camera playback to be controlled by keyboard.
-- Includes extensive comments explaining the implementation.
+## System overview
 
-## How it works
+### Mechanical and electrical system
+
+The physical platform may include:
+
+- A motorized pan-and-tilt camera
+- A mobile wheeled base
+- Motors, encoders, and motor drivers
+- A microcontroller and onboard computer
+- Batteries and power-management hardware
+- Obstacle, limit, and emergency-stop sensors
+
+The mechanical objective is smooth, stable, and quiet camera movement while
+the robot safely tracks a moving subject.
+
+### Software and computer vision
+
+The software will be responsible for:
+
+- Camera input and video pipelines
+- Person, hand, body-pose, and equipment tracking
+- Activity and event detection
+- Buffered video recording and metadata
+- Automatic subject framing
+- Motor and movement commands
+- Data logging and safety monitoring
+
+For skateboarding, the system may measure body and foot position, board angle,
+jump height, approach speed, pop timing, landing alignment, and ride-away
+stability.
+
+For climbing, it may measure body pose, hand and foot placement,
+center-of-mass movement, timing, and route sequences.
+
+### Framing and motion control
+
+The controller will compare the subject’s position in the image with the
+desired framing position. That error will control camera pan, camera tilt,
+robot turning, following distance, and movement speed.
+
+This part of the project will explore:
+
+- Feedback and PID control
+- Encoder feedback and motor limits
+- Latency and control-loop timing
+- Mechanical backlash
+- Acceleration and trajectory smoothing
+- Stable shot composition
+
+### Sports analysis and machine learning
+
+The first sports-analysis system will use measurable features and a clear,
+explainable scoring rubric. Later models can learn from labeled attempts, pose
+data, equipment motion, personal performance history, and user feedback.
+
+These models may eventually:
+
+- Recognize and classify attempts
+- Separate activity phases
+- Predict performance scores
+- Compare current and previous attempts
+- Recommend specific improvements
+
+## Vision-Language-Action architecture
+
+The VLA system connects three responsibilities:
+
+- **Vision** determines what is happening in the environment.
+- **Language** determines what the user requested.
+- **Action** selects and executes safe, tested robot skills.
+
+An instruction could produce the following skill sequence:
 
 ```text
-Camera frame
-    -> mirror the image
-    -> resize a copy to 640 pixels wide
-    -> convert OpenCV BGR pixels to RGB
-    -> run MediaPipe Hand Landmarker
-    -> receive 21 normalized hand landmarks
-    -> update the temporal confidence estimate
-    -> draw landmarks, status, and FPS on the full-size frame
-    -> display the result
+find person
+    -> track subject
+    -> choose wide framing
+    -> begin recording
+    -> detect ollie
+    -> stop recording
+    -> analyze performance
+    -> provide feedback
 ```
 
-MediaPipe runs in video mode, allowing it to reuse tracking information between
-frames instead of treating every frame as an unrelated photograph.
+The language model will select high-level skills and goals. It will not send
+unrestricted commands directly to the motors. Low-level movement remains inside
+tested controllers with speed limits, safety checks, and recovery behavior.
 
-## Requirements
+## Current prototype
 
-- Python 3.12 (tested)
-- A USB or integrated camera
-- Windows, macOS, or Linux with camera access
-- The dependencies listed in `requirements.txt`
-- The `hand_landmarker.task` pretrained model beside the main script
+The current repository contains a lightweight MediaPipe hand-tracking program.
+It opens a camera feed, mirrors the image, tracks 21 hand landmarks, marks the
+wrist and fingertips, reports handedness, and recognizes an open hand or fist.
+A gesture must remain stable for 0.5 seconds before it is confirmed.
 
-The current implementation is CPU-friendly and does not require an NVIDIA GPU.
+The user can start and stop a CSV data session from the camera window. While
+recording, the program writes a sample every 0.25 seconds containing elapsed
+time, whether a hand was detected, its confirmed position, and explicit
+open/fist yes-or-no values. Files are saved under `hand_tracking_data/`.
 
-## Project files
+This prototype develops the real-time perception and video-pipeline foundation
+needed for later gesture commands, recording control, full-body tracking, and
+robot behavior.
 
-```text
-Negentropy/
-|-- InitialCameraDebug       Main hand-tracking program
-|-- hand_landmarker.task     Pretrained MediaPipe hand model
-|-- requirements.txt         Python dependencies
-`-- README.md                Project documentation
-```
+### Run the prototype
 
-## Installation
-
-Open PowerShell in the `Negentropy` directory.
-
-Create an isolated environment:
+Install the Python dependencies:
 
 ```powershell
 python -m venv .venv
-```
-
-Activate it:
-
-```powershell
 & ".\.venv\Scripts\Activate.ps1"
-```
-
-Install the required packages:
-
-```powershell
 python -m pip install -r requirements.txt
 ```
 
-The repository expects `hand_landmarker.task` to already be in the project
-directory. If it is missing, download Google's official float16 Hand Landmarker
-model and save it with that exact filename:
-
-<https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task>
-
-## Running the tracker
-
-From the project directory, run:
+Run the tracker:
 
 ```powershell
 & ".\.venv\Scripts\python.exe" ".\InitialCameraDebug"
 ```
 
-The terminal reports which camera was opened and lists the available controls.
-
-## Controls
+Controls:
 
 | Key | Action |
 | --- | --- |
 | `L` | Show or hide hand landmarks |
 | `P` | Pause or resume the camera |
-| `Q` | Quit and release the camera |
-
-## Landmark colors
-
-| Color | Meaning |
-| --- | --- |
-| Green | Finger joints and hand connections |
-| Orange | Fingertips |
-| Cyan | Wrist/base of the hand |
-
-## Configuration
-
-The tuning variables are near the beginning of `InitialCameraDebug`.
-
-Important settings include:
-
-- `PROCESSING_WIDTH`: Lower values improve speed; higher values preserve detail.
-- `NUMBER_OF_HANDS`: Maximum number of hands MediaPipe should track.
-- `MINIMUM_HAND_DETECTION_CONFIDENCE`: Initial hand-detection threshold.
-- `MINIMUM_HAND_PRESENCE_CONFIDENCE`: Required hand-presence threshold.
-- `MINIMUM_TRACKING_CONFIDENCE`: Required tracking threshold between frames.
-- `DETECTED_CONFIDENCE_GAIN`: How quickly displayed hand confidence rises.
-- `MISSING_CONFIDENCE_LOSS`: How quickly displayed hand confidence falls.
-
-Lower model thresholds accept less-certain detections but can increase false
-positives. Higher thresholds reduce false positives but can lose partially
-hidden, distant, or poorly lit hands.
-
-## Confidence note
-
-The displayed confidence is a **temporal estimate**, not MediaPipe's raw model
-probability. MediaPipe's public Hand Landmarker result provides landmarks and
-handedness but does not expose the raw hand-presence score.
-
-The application therefore calculates an understandable state estimate:
-
-```text
-Repeated hand detections -> hand confidence rises
-Repeated missed frames   -> hand confidence falls
-No-hand confidence       -> 1 - hand confidence
-```
-
-This makes momentary tracking loss less distracting, but the value should not
-be interpreted as a scientifically calibrated probability.
+| `R` | Start a new CSV recording session |
+| `S` | Stop and save the active CSV session |
+| `Q` | Quit |
 
 ## Development roadmap
 
-| Phase | What you build | Skills developed | End goal |
-| --- | --- | --- | --- |
-| **1. Smart Fixed Camera** | Gesture detection, full-body tracking, event detection, buffered recording, and metadata | Python, OpenCV, MediaPipe, state machines, and video pipelines | Automatically detect and save complete activity clips |
-| **2. Robotic Cameraperson** | Framing controller, pan-tilt mechanism, smooth tracking, and shot modes | PID control, motors, embedded systems, and camera geometry | Physically keep the subject framed while they move |
-| **3. Sports Analysis System** | Skateboard tracking, ollie phase detection, body/board measurements, and scoring | Object detection, time-series analysis, feature engineering, and machine learning | Record an ollie, rate it, and explain improvements |
-| **4. VLA Mobile Filmmaker** | Voice commands, skill planning, follow-me base, safety, and recovery | ROS 2, speech, VLA architecture, navigation, and system integration | Understand commands such as “follow me and record my next ollie” |
+### Servo camera synchronization prototype
 
-## Next milestone
+`ServoCameraSync.py` connects the current MediaPipe gesture detector to the
+Arduino sketch over USB serial at 9600 baud:
 
-The next logical step in Phase 1 is gesture recognition. The existing 21 hand
-landmarks can be converted into gestures such as start recording, stop
-recording, or mark an event. That state can then drive a buffered video recorder
-that preserves several seconds before and after each detected activity.
+| Confirmed camera state | Servo command |
+| --- | ---: |
+| Fist | 0° |
+| No hand | 90° |
+| Open hand | 180° |
 
-## Known limitations
+Open and fist gestures must remain stable for 0.5 seconds before a command is
+sent. Hand loss is also confirmed for 0.5 seconds to prevent a single missed
+frame from moving the servo. The program sends only changed angles, centers the
+servo during startup and exit, and automatically selects the likely Arduino
+USB port. Set `SERIAL_PORT` near the beginning of the file if a manual COM port
+is needed.
 
-- Only one hand is tracked by default.
-- Fast motion, severe occlusion, poor lighting, or a very small hand can cause
-  temporary tracking loss.
-- The confidence indicator is temporal rather than a raw neural-network score.
-- The program tracks hand landmarks but does not yet recognize gestures.
-- It does not yet record video clips or produce metadata.
+Close Arduino IDE's Serial Monitor before running the Python program because
+only one application can use a serial port at a time. Keep the Arduino sketch
+uploaded, then run:
+
+```powershell
+python -m pip install -r requirements.txt
+& ".\.venv\Scripts\python.exe" ".\ServoCameraSync.py"
+```
+
+Controls:
+
+| Key | Action |
+| --- | --- |
+| `L` | Show or hide hand landmarks |
+| `P` | Pause or resume camera processing |
+| `C` | Center the servo at 90° |
+| `Q` | Center the servo and quit |
+
+| Phase | System | End goal |
+| --- | --- | --- |
+| **1** | Smart fixed camera | Detect activities and automatically save complete clips with metadata |
+| **2** | Robotic cameraperson | Physically follow the subject and maintain smooth framing |
+| **3** | Sports-analysis system | Measure, score, and explain athletic performance |
+| **4** | VLA mobile filmmaker | Understand spoken goals and coordinate perception, filming, navigation, analysis, and safety |
+
+## What this project is intended to teach
+
+This project is a practical path toward understanding how complete intelligent
+robots are designed and integrated. Key learning areas include:
+
+- Python, OpenCV, MediaPipe, and video processing
+- Software architecture and state machines
+- Mechanical design and embedded electronics
+- Motors, encoders, PID control, and camera geometry
+- ROS 2, navigation, and mobile robotics
+- Pose estimation and object tracking
+- Feature engineering and machine learning
+- VLA architecture and skill planning
+- Testing, safety, fault handling, and recovery
+
+## Final outcome
+
+The final system should receive a spoken instruction, locate and follow the
+user, control the camera, record the requested activity, analyze the footage,
+and return understandable feedback.
+
+The overall objective is a modular intelligent robot that acts as a personal
+cameraperson, activity tracker, and sports-performance coach.
