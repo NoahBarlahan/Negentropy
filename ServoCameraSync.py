@@ -1,21 +1,16 @@
-"""Control an Arduino camera servo with MediaPipe hand gestures.
+"""Track a hand horizontally and aim an Arduino-controlled camera servo.
 
 Arduino protocol
 ----------------
-The Arduino sketch listens at 9600 baud for a line containing an integer from
-0 through 180. This program sends exactly that protocol:
+The Arduino sketch listens at 9600 baud for a newline-terminated angle from
+0 through 180. Screen-left maps to 0 degrees, the center maps to 90 degrees,
+and screen-right maps to 180 degrees. Fast hand jumps are rejected; accepted
+positions and servo commands are smoothed so the mechanism moves gradually.
 
-    confirmed fist       -> ``0\n``
-    no hand              -> ``90\n``
-    confirmed open hand  -> ``180\n``
-
-Gestures and hand loss must remain stable briefly before a command is sent.
-Only changed angles are sent, preventing unnecessary serial traffic and servo
-jitter. Close Arduino IDE's Serial Monitor before starting this program because
-only one application can own a serial port at a time.
+Close Arduino IDE's Serial Monitor before starting this program because only
+one application can own a serial port at a time.
 """
 
-import math
 from pathlib import Path
 import time
 
@@ -46,10 +41,33 @@ SERIAL_PORT: str | None = None
 SERIAL_BAUD_RATE = 9600
 ARDUINO_RESET_WAIT_SECONDS = 2.0
 
-FIST_SERVO_ANGLE = 0
-NO_HAND_SERVO_ANGLE = 90
-OPEN_SERVO_ANGLE = 180
+MINIMUM_SERVO_ANGLE = 0
+CENTER_SERVO_ANGLE = 90
+MAXIMUM_SERVO_ANGLE = 180
 CENTER_SERVO_ON_EXIT = True
+REVERSE_SERVO_DIRECTION = False
+
+# Motion filtering ---------------------------------------------------------
+# A hand jump faster than this fraction of the frame width per second is
+# ignored. Lower this value to accept only slower hand movement.
+MAX_VALID_HAND_SPEED_NORMALIZED_PER_SECOND = 0.70
+
+# A position must remain slow for this long after a fast jump before the new
+# location can become a servo target.
+SLOW_POSITION_CONFIRMATION_SECONDS = 0.25
+
+# Exponential smoothing: lower values are smoother but respond more slowly.
+# This must be greater than 0 and no greater than 1.
+HAND_POSITION_SMOOTHING = 0.18
+
+# Brief detection dropouts hold the last target. A longer loss recenters.
+NO_HAND_CONFIRMATION_SECONDS = 0.50
+
+# Even accepted position changes cannot move the requested angle faster than
+# this rate, preventing abrupt servo movement.
+MAX_SERVO_SPEED_DEGREES_PER_SECOND = 55.0
+SERVO_COMMAND_DEADBAND_DEGREES = 1
+MINIMUM_SERVO_COMMAND_INTERVAL_SECONDS = 0.04
 
 # MediaPipe configuration ---------------------------------------------------
 HAND_MODEL_PATH = Path(__file__).with_name("hand_landmarker.task")
@@ -57,22 +75,12 @@ MINIMUM_HAND_DETECTION_CONFIDENCE = 0.30
 MINIMUM_HAND_PRESENCE_CONFIDENCE = 0.30
 MINIMUM_TRACKING_CONFIDENCE = 0.40
 
-# A sign must remain unchanged this long before it controls the servo. Hand
-# loss is also delayed, preventing a single missed frame from snapping to 90°.
-GESTURE_CONFIRMATION_SECONDS = 0.50
-NO_HAND_CONFIRMATION_SECONDS = 0.50
-
-# Finger-angle thresholds copied from the tested hand-tracking prototype.
-EXTENDED_FINGER_ANGLE = 150.0
-CURLED_FINGER_ANGLE = 115.0
-OPEN_HAND_MINIMUM_EXTENDED_FINGERS = 3
-FIST_MAXIMUM_EXTENDED_FINGERS = 1
-
 # Display configuration -----------------------------------------------------
 HAND_COLOR = (0, 255, 0)
 JOINT_COLOR = (0, 255, 0)
 FINGERTIP_COLOR = (0, 165, 255)
 WRIST_COLOR = (255, 255, 0)
+PALM_CENTER_COLOR = (255, 0, 255)
 TEXT_COLOR = (0, 255, 0)
 WARNING_COLOR = (0, 165, 255)
 CONNECTION_THICKNESS = 2
@@ -88,15 +96,7 @@ EXIT_KEY = ord("q")
 
 WRIST_LANDMARK = 0
 FINGERTIP_LANDMARKS = {4, 8, 12, 16, 20}
-
-# (base, middle, tip) for index, middle, ring, and pinky. The thumb is omitted
-# because its direction varies more between people and camera angles.
-FINGER_ANGLE_LANDMARKS = (
-    (5, 6, 8),
-    (9, 10, 12),
-    (13, 14, 16),
-    (17, 18, 20),
-)
+PALM_CENTER_LANDMARKS = (0, 5, 9, 13, 17)
 
 HAND_CONNECTIONS = (
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -109,15 +109,20 @@ HAND_CONNECTIONS = (
 
 
 def print_controls(port_name: str) -> None:
-    """Print the gesture mapping and keyboard controls."""
+    """Print the position mapping, filters, and keyboard controls."""
 
     print()
     print("SERVO CAMERA SYNC")
     print("----------------------------------------")
     print(f"Arduino port: {port_name} at {SERIAL_BAUD_RATE} baud")
-    print(f"FIST     -> {FIST_SERVO_ANGLE} degrees")
-    print(f"NO HAND  -> {NO_HAND_SERVO_ANGLE} degrees")
-    print(f"OPEN     -> {OPEN_SERVO_ANGLE} degrees")
+    print(f"SCREEN LEFT   -> {MINIMUM_SERVO_ANGLE} degrees")
+    print(f"SCREEN CENTER -> {CENTER_SERVO_ANGLE} degrees")
+    print(f"SCREEN RIGHT  -> {MAXIMUM_SERVO_ANGLE} degrees")
+    print(f"NO HAND       -> {CENTER_SERVO_ANGLE} degrees")
+    print(
+        "Fast-motion limit: "
+        f"{MAX_VALID_HAND_SPEED_NORMALIZED_PER_SECOND:.2f} frame widths/s"
+    )
     print("----------------------------------------")
     print("L   Show or hide hand landmarks")
     print("P   Pause or resume camera processing")
@@ -219,7 +224,7 @@ class ServoController:
         # setup() completes before sending the initial center command.
         time.sleep(ARDUINO_RESET_WAIT_SECONDS)
         self.connection.reset_input_buffer()
-        self.command_angle(NO_HAND_SERVO_ANGLE, force=True)
+        self.command_angle(CENTER_SERVO_ANGLE, force=True)
 
     def command_angle(self, angle: int, force: bool = False) -> bool:
         """Send one valid, changed servo angle. Return True when data was sent."""
@@ -253,7 +258,7 @@ class ServoController:
             return
 
         if CENTER_SERVO_ON_EXIT:
-            self.command_angle(NO_HAND_SERVO_ANGLE)
+            self.command_angle(CENTER_SERVO_ANGLE)
             time.sleep(0.15)
         self.connection.close()
 
@@ -328,118 +333,182 @@ def draw_hand_landmarks(frame, hand_landmarks) -> None:
         cv2.circle(frame, point, radius, color, -1, cv2.LINE_AA)
 
 
-def joint_angle(first, middle, last) -> float:
-    """Return the three-dimensional angle at a finger's middle landmark."""
+def palm_center(hand_landmarks) -> tuple[float, float]:
+    """Return a stable normalized center using the wrist and four knuckles."""
 
-    first_vector = (
-        first.x - middle.x,
-        first.y - middle.y,
-        first.z - middle.z,
+    center_x = sum(
+        hand_landmarks[index].x for index in PALM_CENTER_LANDMARKS
+    ) / len(PALM_CENTER_LANDMARKS)
+    center_y = sum(
+        hand_landmarks[index].y for index in PALM_CENTER_LANDMARKS
+    ) / len(PALM_CENTER_LANDMARKS)
+    return (
+        min(1.0, max(0.0, center_x)),
+        min(1.0, max(0.0, center_y)),
     )
-    last_vector = (
-        last.x - middle.x,
-        last.y - middle.y,
-        last.z - middle.z,
-    )
-    dot_product = sum(
-        first_value * last_value
-        for first_value, last_value in zip(first_vector, last_vector)
-    )
-    first_length = math.sqrt(sum(value * value for value in first_vector))
-    last_length = math.sqrt(sum(value * value for value in last_vector))
-
-    if first_length == 0.0 or last_length == 0.0:
-        return 0.0
-
-    cosine = dot_product / (first_length * last_length)
-    return math.degrees(math.acos(min(1.0, max(-1.0, cosine))))
 
 
-def classify_hand_gesture(hand_landmarks) -> str:
-    """Classify the current hand as OPEN, FIST, or UNKNOWN."""
+def normalized_x_to_servo_angle(normalized_x: float) -> float:
+    """Linearly map a horizontal image position to the servo angle range."""
 
-    angles = [
-        joint_angle(
-            hand_landmarks[base],
-            hand_landmarks[middle],
-            hand_landmarks[tip],
+    clamped_x = min(1.0, max(0.0, normalized_x))
+    if REVERSE_SERVO_DIRECTION:
+        clamped_x = 1.0 - clamped_x
+
+    servo_range = MAXIMUM_SERVO_ANGLE - MINIMUM_SERVO_ANGLE
+    return MINIMUM_SERVO_ANGLE + clamped_x * servo_range
+
+
+class HandPositionFilter:
+    """Reject fast observations and smooth accepted palm positions."""
+
+    def __init__(self) -> None:
+        self.previous_observed_x: float | None = None
+        self.previous_observed_time: float | None = None
+        self.slow_since: float | None = None
+        self.filtered_x: float | None = None
+        self.no_hand_since: float | None = None
+        self.target_angle = float(CENTER_SERVO_ANGLE)
+        self.last_center: tuple[float, float] | None = None
+        self.last_speed = 0.0
+        self.status = "NO HAND - CENTERING"
+
+    def update(
+        self,
+        observed_center: tuple[float, float] | None,
+        current_time: float,
+    ) -> float:
+        """Process one observation and return the latest valid target angle."""
+
+        if observed_center is None:
+            self.last_center = None
+            self.previous_observed_x = None
+            self.previous_observed_time = None
+            self.slow_since = None
+            self.last_speed = 0.0
+
+            if self.no_hand_since is None:
+                self.no_hand_since = current_time
+
+            missing_time = current_time - self.no_hand_since
+            if missing_time >= NO_HAND_CONFIRMATION_SECONDS:
+                self.filtered_x = None
+                self.target_angle = float(CENTER_SERVO_ANGLE)
+                self.status = "NO HAND - CENTERING"
+            else:
+                self.status = "HAND LOST BRIEFLY - HOLDING"
+            return self.target_angle
+
+        self.no_hand_since = None
+        self.last_center = observed_center
+        observed_x = observed_center[0]
+
+        if (
+            self.previous_observed_x is None
+            or self.previous_observed_time is None
+        ):
+            speed = 0.0
+        else:
+            elapsed = current_time - self.previous_observed_time
+            speed = (
+                abs(observed_x - self.previous_observed_x) / elapsed
+                if elapsed > 0.0
+                else float("inf")
+            )
+
+        self.previous_observed_x = observed_x
+        self.previous_observed_time = current_time
+        self.last_speed = speed
+
+        if speed > MAX_VALID_HAND_SPEED_NORMALIZED_PER_SECOND:
+            self.slow_since = None
+            self.status = "FAST MOVEMENT IGNORED"
+            return self.target_angle
+
+        if self.slow_since is None:
+            self.slow_since = current_time
+
+        if current_time - self.slow_since < SLOW_POSITION_CONFIRMATION_SECONDS:
+            self.status = "CHECKING SLOW POSITION..."
+            return self.target_angle
+
+        if self.filtered_x is None:
+            self.filtered_x = observed_x
+        else:
+            alpha = min(1.0, max(0.0001, HAND_POSITION_SMOOTHING))
+            self.filtered_x += alpha * (observed_x - self.filtered_x)
+
+        self.target_angle = normalized_x_to_servo_angle(self.filtered_x)
+        self.status = "TRACKING SLOW HAND MOVEMENT"
+        return self.target_angle
+
+
+class SmoothServoMotion:
+    """Move toward a target at a limited rate and avoid serial chatter."""
+
+    def __init__(self, current_time: float) -> None:
+        self.current_angle = float(CENTER_SERVO_ANGLE)
+        self.target_angle = float(CENTER_SERVO_ANGLE)
+        self.previous_update_time = current_time
+        self.last_command_time = current_time
+        self.last_commanded_angle = CENTER_SERVO_ANGLE
+
+    def set_target(self, angle: float) -> None:
+        self.target_angle = min(
+            float(MAXIMUM_SERVO_ANGLE),
+            max(float(MINIMUM_SERVO_ANGLE), angle),
         )
-        for base, middle, tip in FINGER_ANGLE_LANDMARKS
-    ]
-    extended_count = sum(angle >= EXTENDED_FINGER_ANGLE for angle in angles)
-    average_angle = sum(angles) / len(angles)
 
-    if extended_count >= OPEN_HAND_MINIMUM_EXTENDED_FINGERS:
-        return "OPEN"
+    def update(self, current_time: float, servo: ServoController) -> int:
+        """Rate-limit motion and send a command only when meaningfully changed."""
 
-    if (
-        extended_count <= FIST_MAXIMUM_EXTENDED_FINGERS
-        and average_angle <= CURLED_FINGER_ANGLE
-    ):
-        return "FIST"
+        elapsed = max(0.0, min(0.1, current_time - self.previous_update_time))
+        self.previous_update_time = current_time
+        maximum_change = MAX_SERVO_SPEED_DEGREES_PER_SECOND * elapsed
+        remaining_change = self.target_angle - self.current_angle
 
-    return "UNKNOWN"
+        if abs(remaining_change) <= maximum_change:
+            self.current_angle = self.target_angle
+        elif remaining_change > 0.0:
+            self.current_angle += maximum_change
+        else:
+            self.current_angle -= maximum_change
 
+        command = int(round(self.current_angle))
+        enough_change = (
+            abs(command - self.last_commanded_angle)
+            >= SERVO_COMMAND_DEADBAND_DEGREES
+        )
+        enough_time = (
+            current_time - self.last_command_time
+            >= MINIMUM_SERVO_COMMAND_INTERVAL_SECONDS
+        )
+        if enough_change and enough_time:
+            if servo.command_angle(command):
+                self.last_commanded_angle = command
+                self.last_command_time = current_time
 
-def update_stable_state(
-    observed_state: str,
-    candidate_state: str,
-    candidate_since: float,
-    current_time: float,
-) -> tuple[str, float, str | None]:
-    """Confirm a state only after its configured stability period."""
-
-    if observed_state != candidate_state:
-        return observed_state, current_time, None
-
-    confirmation_time = (
-        NO_HAND_CONFIRMATION_SECONDS
-        if observed_state == "NO_HAND"
-        else GESTURE_CONFIRMATION_SECONDS
-    )
-
-    if (
-        observed_state in {"OPEN", "FIST", "NO_HAND"}
-        and current_time - candidate_since >= confirmation_time
-    ):
-        return candidate_state, candidate_since, observed_state
-
-    return candidate_state, candidate_since, None
-
-
-def state_to_servo_angle(confirmed_state: str | None) -> int | None:
-    """Map a confirmed visual state to its requested servo position."""
-
-    return {
-        "FIST": FIST_SERVO_ANGLE,
-        "NO_HAND": NO_HAND_SERVO_ANGLE,
-        "OPEN": OPEN_SERVO_ANGLE,
-    }.get(confirmed_state)
+        return command
 
 
 def draw_status(
     frame,
     port_name: str,
-    observed_state: str,
-    confirmed_state: str | None,
-    servo_angle: int | None,
+    position_filter: HandPositionFilter,
+    motion: SmoothServoMotion,
     fps: float,
 ) -> None:
-    """Draw gesture, servo, port, and frame-rate status."""
+    """Draw tracking, speed, target-angle, and frame-rate status."""
 
-    if confirmed_state and observed_state == confirmed_state:
-        state_text = confirmed_state.replace("_", " ")
-        color = TEXT_COLOR
-    elif observed_state in {"OPEN", "FIST", "NO_HAND"}:
-        state_text = f"CHECKING {observed_state.replace('_', ' ')}..."
-        color = WARNING_COLOR
-    else:
-        state_text = "UNKNOWN - HOLDING LAST ANGLE"
-        color = WARNING_COLOR
+    color = (
+        TEXT_COLOR
+        if position_filter.status == "TRACKING SLOW HAND MOVEMENT"
+        else WARNING_COLOR
+    )
 
     cv2.putText(
         frame,
-        f"HAND STATE: {state_text}",
+        f"STATUS: {position_filter.status}",
         (20, 35),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.70,
@@ -449,8 +518,8 @@ def draw_status(
     )
     cv2.putText(
         frame,
-        f"SERVO: {servo_angle if servo_angle is not None else '--'} deg  "
-        f"ARDUINO: {port_name}",
+        f"SERVO: {motion.current_angle:.0f} deg  "
+        f"TARGET: {motion.target_angle:.0f} deg  PORT: {port_name}",
         (20, 68),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.65,
@@ -460,6 +529,7 @@ def draw_status(
     )
     cv2.putText(
         frame,
+        f"HAND SPEED: {position_filter.last_speed:.2f} widths/s  "
         f"FPS: {fps:.1f}",
         (20, 101),
         cv2.FONT_HERSHEY_SIMPLEX,
@@ -471,7 +541,7 @@ def draw_status(
 
 
 def main() -> None:
-    """Run hand detection and synchronize confirmed states with the servo."""
+    """Track a palm center and smoothly synchronize it with the servo."""
 
     port_name = find_arduino_port()
     servo = ServoController(port_name)
@@ -490,10 +560,9 @@ def main() -> None:
     show_landmarks = True
     frame = None
     latest_result = None
-    observed_state = "NO_HAND"
-    candidate_state = "NO_HAND"
-    candidate_since = time.monotonic()
-    confirmed_state: str | None = "NO_HAND"
+    current_time = time.monotonic()
+    position_filter = HandPositionFilter()
+    motion = SmoothServoMotion(current_time)
     last_timestamp_ms = 0
     previous_frame_time = time.perf_counter()
     smoothed_fps = 0.0
@@ -521,30 +590,18 @@ def main() -> None:
                         timestamp_ms,
                     )
 
-                    if latest_result.hand_landmarks:
-                        observed_state = classify_hand_gesture(
-                            latest_result.hand_landmarks[0]
-                        )
-                    else:
-                        observed_state = "NO_HAND"
-
                     current_time = time.monotonic()
-                    (
-                        candidate_state,
-                        candidate_since,
-                        newly_confirmed_state,
-                    ) = update_stable_state(
-                        observed_state,
-                        candidate_state,
-                        candidate_since,
+                    observed_center = (
+                        palm_center(latest_result.hand_landmarks[0])
+                        if latest_result.hand_landmarks
+                        else None
+                    )
+                    target_angle = position_filter.update(
+                        observed_center,
                         current_time,
                     )
-
-                    if newly_confirmed_state:
-                        confirmed_state = newly_confirmed_state
-                        requested_angle = state_to_servo_angle(confirmed_state)
-                        if requested_angle is not None:
-                            servo.command_angle(requested_angle)
+                    motion.set_target(target_angle)
+                    motion.update(current_time, servo)
 
                     current_frame_time = time.perf_counter()
                     elapsed = current_frame_time - previous_frame_time
@@ -571,12 +628,28 @@ def main() -> None:
                             latest_result.hand_landmarks[0],
                         )
 
+                    if position_filter.last_center is not None:
+                        frame_height, frame_width = display.shape[:2]
+                        center_x = int(
+                            position_filter.last_center[0] * frame_width
+                        )
+                        center_y = int(
+                            position_filter.last_center[1] * frame_height
+                        )
+                        cv2.circle(
+                            display,
+                            (center_x, center_y),
+                            12,
+                            PALM_CENTER_COLOR,
+                            -1,
+                            cv2.LINE_AA,
+                        )
+
                     draw_status(
                         display,
                         port_name,
-                        observed_state,
-                        confirmed_state,
-                        servo.last_angle,
+                        position_filter,
+                        motion,
                         smoothed_fps,
                     )
                     cv2.imshow("Servo Camera Sync", display)
@@ -588,8 +661,11 @@ def main() -> None:
                     paused = not paused
                     print("Paused." if paused else "Resumed.")
                 elif key == CENTER_KEY:
-                    servo.command_angle(NO_HAND_SERVO_ANGLE)
-                    confirmed_state = "NO_HAND"
+                    position_filter.target_angle = float(CENTER_SERVO_ANGLE)
+                    position_filter.filtered_x = None
+                    position_filter.slow_since = None
+                    position_filter.status = "MANUALLY CENTERING"
+                    motion.set_target(CENTER_SERVO_ANGLE)
                 elif key == EXIT_KEY:
                     break
 

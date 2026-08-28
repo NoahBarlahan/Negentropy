@@ -150,21 +150,29 @@ Controls:
 
 ### Servo camera synchronization prototype
 
-`ServoCameraSync.py` connects the current MediaPipe gesture detector to the
-Arduino sketch over USB serial at 9600 baud:
+`ServoCameraSync.py` connects MediaPipe hand tracking to the Arduino sketch
+over USB serial at 9600 baud. It tracks the center of the palm using the wrist
+and four knuckle landmarks, then maps the horizontal camera position directly
+to a servo angle:
 
-| Confirmed camera state | Servo command |
+| Palm position in the mirrored image | Servo target |
 | --- | ---: |
-| Fist | 0° |
-| No hand | 90° |
-| Open hand | 180° |
+| Far left | 0° |
+| Center | 90° |
+| Far right | 180° |
+| No hand for 0.5 seconds | 90° |
 
-Open and fist gestures must remain stable for 0.5 seconds before a command is
-sent. Hand loss is also confirmed for 0.5 seconds to prevent a single missed
-frame from moving the servo. The program sends only changed angles, centers the
-servo during startup and exit, and automatically selects the likely Arduino
-USB port. Set `SERIAL_PORT` near the beginning of the file if a manual COM port
-is needed.
+Fast hand jumps are rejected. A position must remain slow for 0.25 seconds
+before it becomes valid, accepted positions are smoothed, and servo movement
+is limited to 55 degrees per second. This prevents quick tracking errors from
+causing sudden mechanical motion. The program centers the servo during startup
+and exit and automatically selects the likely Arduino USB port. The main tuning
+variables are near the beginning of the file: `MAX_VALID_HAND_SPEED_NORMALIZED_PER_SECOND`,
+`SLOW_POSITION_CONFIRMATION_SECONDS`, `HAND_POSITION_SMOOTHING`,
+`MAX_SERVO_SPEED_DEGREES_PER_SECOND`, and `NO_HAND_CONFIRMATION_SECONDS`.
+Set `SERIAL_PORT` if a manual COM port is needed, or set
+`REVERSE_SERVO_DIRECTION = True` if the physical servo moves opposite the
+displayed hand direction.
 
 Close Arduino IDE's Serial Monitor before running the Python program because
 only one application can use a serial port at a time. Keep the Arduino sketch
