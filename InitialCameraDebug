@@ -1,8 +1,9 @@
 """Real-time hand tracking with OpenCV and MediaPipe.
 
 The program reads frames from a camera, asks MediaPipe to find the hand's
-21 landmarks, recognizes open-hand and fist gestures, and records timed CSV data.
-Keyboard controls are handled inside the main camera loop near the bottom.
+21 landmarks, recognizes open-hand and fist gestures, tracks the palm center,
+and records synchronized CSV data plus mirrored MP4 video. Keyboard controls
+are handled inside the main camera loop near the bottom.
 """
 
 import csv  # Writes time-based hand observations to spreadsheet-ready files.
@@ -65,10 +66,16 @@ CURLED_FINGER_ANGLE = 115.0
 OPEN_HAND_MINIMUM_EXTENDED_FINGERS = 3
 FIST_MAXIMUM_EXTENDED_FINGERS = 1
 
-# CSV data-recording settings
-# A sample is written four times per second while recording is active.
+# CSV and video-recording settings
+# A data sample is written four times per second while recording is active.
 CSV_SAMPLE_INTERVAL_SECONDS = 0.25
 CSV_OUTPUT_DIRECTORY = Path(__file__).with_name("hand_tracking_data")
+
+# VideoWriter uses a constant frame rate. The recorder duplicates or skips
+# camera frames against a monotonic clock so video time remains aligned with
+# the CSV even when hand-detection processing speed changes.
+VIDEO_RECORDING_FPS = 20.0
+VIDEO_CODEC = "mp4v"
 
 # Drawing settings
 # OpenCV colors use BGR order rather than the more common RGB order.
@@ -76,12 +83,14 @@ HAND_COLOR = (0, 255, 0)
 JOINT_COLOR = (0, 255, 0)
 FINGERTIP_COLOR = (0, 165, 255)
 WRIST_COLOR = (255, 255, 0)
+PALM_CENTER_COLOR = (255, 0, 255)
 TEXT_COLOR = (0, 255, 0)
 WARNING_COLOR = (0, 165, 255)
 CONNECTION_THICKNESS = 2
 JOINT_RADIUS = 4
 FINGERTIP_RADIUS = 7
 WRIST_RADIUS = 9
+PALM_CENTER_RADIUS = 10
 
 # Controls
 # ord() converts a character into the numeric key code returned by waitKey().
@@ -97,6 +106,10 @@ STOP_RECORDING_KEY = ord("s")
 # thumb, index finger, middle finger, ring finger, and pinky.
 WRIST_LANDMARK = 0
 FINGERTIP_LANDMARKS = {4, 8, 12, 16, 20}
+
+# The wrist and four finger-base landmarks define a stable palm center. Using
+# these points avoids the large center changes caused by opening the fingers.
+PALM_CENTER_LANDMARKS = (0, 5, 9, 13, 17)
 
 # Each tuple is (base joint, middle joint, fingertip). The angle at the middle
 # joint indicates whether that finger is extended or curled. Thumb landmarks
@@ -143,13 +156,15 @@ def print_controls() -> None:
     print("--------------------------------")
     print("L       Show or hide landmarks")
     print("P       Pause or resume")
-    print("R       Start recording hand data to CSV")
-    print("S       Stop recording hand data")
+    print("R       Start recording CSV data and MP4 video")
+    print("S       Stop and save CSV data and MP4 video")
     print("Q       Quit")
     print("--------------------------------")
     print("Green dots: finger joints")
     print("Orange dots: fingertips")
     print("Cyan dot: wrist / base of hand")
+    print("Magenta dot: recorded palm center")
+    print("CSV position origin: bottom-left of the displayed camera frame")
     print()
 
 
@@ -229,6 +244,51 @@ def normalized_to_pixel(landmark, width: int, height: int) -> tuple[int, int]:
     x = min(max(landmark.x, 0.0), 1.0)
     y = min(max(landmark.y, 0.0), 1.0)
     return int(x * width), int(y * height)
+
+
+def calculate_hand_center_pixels(
+    hand_landmarks,
+    frame_width: int,
+    frame_height: int,
+) -> tuple[int, int]:
+    """Return the palm center in pixels using a bottom-left coordinate origin.
+
+    MediaPipe's origin is at the top-left and its Y coordinate increases
+    downward. Averaging the wrist and four knuckles gives a stable palm center;
+    subtracting normalized Y from 1 makes recorded Y increase upward.
+    """
+
+    center_x_normalized = sum(
+        hand_landmarks[index].x for index in PALM_CENTER_LANDMARKS
+    ) / len(PALM_CENTER_LANDMARKS)
+    center_y_normalized = sum(
+        hand_landmarks[index].y for index in PALM_CENTER_LANDMARKS
+    ) / len(PALM_CENTER_LANDMARKS)
+
+    center_x_normalized = min(1.0, max(0.0, center_x_normalized))
+    center_y_normalized = min(1.0, max(0.0, center_y_normalized))
+
+    maximum_x = max(0, frame_width - 1)
+    maximum_y = max(0, frame_height - 1)
+    center_x_pixels = round(center_x_normalized * maximum_x)
+    center_y_pixels = round((1.0 - center_y_normalized) * maximum_y)
+    return center_x_pixels, center_y_pixels
+
+
+def draw_hand_center(frame, hand_center_pixels: tuple[int, int]) -> None:
+    """Draw the recorded bottom-left-origin palm center on the display frame."""
+
+    frame_height = frame.shape[0]
+    center_x, center_y_from_bottom = hand_center_pixels
+    center_y_for_opencv = frame_height - 1 - center_y_from_bottom
+    cv2.circle(
+        frame,
+        (center_x, center_y_for_opencv),
+        PALM_CENTER_RADIUS,
+        PALM_CENTER_COLOR,
+        -1,
+        cv2.LINE_AA,
+    )
 
 
 def draw_hand_landmarks(frame, hand_landmarks) -> None:
@@ -346,41 +406,83 @@ def update_gesture_state(
 
 
 class HandDataRecorder:
-    """Create a CSV session and sample the latest hand state every 0.25 seconds."""
+    """Record synchronized CSV observations and mirrored MP4 camera frames."""
 
     def __init__(self) -> None:
         self.file = None
         self.writer = None
         self.output_path = None
+        self.video_writer = None
+        self.video_output_path = None
         self.started_at = 0.0
         self.next_sample_at = 0.0
+        self.next_video_frame_at = 0.0
         self.sample_number = 0
+        self.video_frame_count = 0
 
     @property
     def is_recording(self) -> bool:
-        """Return True while a CSV file is open for data collection."""
+        """Return True while a synchronized recording session is active."""
 
         return self.file is not None
 
-    def start(self) -> None:
-        """Open a new timestamped CSV file and write its column headings."""
+    def start(self, first_frame) -> None:
+        """Open timestamp-matched CSV and MP4 files for a new session."""
 
         if self.is_recording:
-            print(f"Data recording is already active: {self.output_path}")
+            print("CSV and video recording are already active:")
+            print(f"  Data:  {self.output_path}")
+            print(f"  Video: {self.video_output_path}")
+            return
+
+        if first_frame is None:
+            print("Cannot start recording before the first camera frame.")
             return
 
         CSV_OUTPUT_DIRECTORY.mkdir(parents=True, exist_ok=True)
-        filename = datetime.now().strftime(
-            "hand_tracking_%Y%m%d_%H%M%S_%f.csv"
+        session_name = datetime.now().strftime(
+            "hand_tracking_%Y%m%d_%H%M%S_%f"
         )
-        self.output_path = CSV_OUTPUT_DIRECTORY / filename
-        self.file = self.output_path.open("w", newline="", encoding="utf-8")
+        csv_output_path = CSV_OUTPUT_DIRECTORY / f"{session_name}.csv"
+        video_output_path = CSV_OUTPUT_DIRECTORY / f"{session_name}.mp4"
+
+        frame_height, frame_width = first_frame.shape[:2]
+        codec = cv2.VideoWriter_fourcc(*VIDEO_CODEC)
+        video_writer = cv2.VideoWriter(
+            str(video_output_path),
+            codec,
+            VIDEO_RECORDING_FPS,
+            (frame_width, frame_height),
+        )
+        if not video_writer.isOpened():
+            video_writer.release()
+            raise RuntimeError(
+                "Could not open the MP4 video writer. "
+                f"Codec: {VIDEO_CODEC}; output: {video_output_path}"
+            )
+
+        try:
+            csv_file = csv_output_path.open(
+                "w",
+                newline="",
+                encoding="utf-8",
+            )
+        except OSError:
+            video_writer.release()
+            raise
+
+        self.output_path = csv_output_path
+        self.video_output_path = video_output_path
+        self.file = csv_file
         self.writer = csv.writer(self.file)
+        self.video_writer = video_writer
         self.writer.writerow(
             [
                 "sample_number",
                 "elapsed_seconds",
                 "hand_detected",
+                "hand_center_x_pixels",
+                "hand_center_y_pixels",
                 "hand_position",
                 "hand_open",
                 "hand_fist",
@@ -390,13 +492,18 @@ class HandDataRecorder:
 
         self.started_at = time.monotonic()
         self.next_sample_at = self.started_at
+        self.next_video_frame_at = self.started_at
         self.sample_number = 0
-        print(f"Started recording hand data: {self.output_path}")
+        self.video_frame_count = 0
+        print("Started synchronized recording:")
+        print(f"  Data:  {self.output_path}")
+        print(f"  Video: {self.video_output_path}")
 
     def record_if_due(
         self,
         current_time: float,
         hand_detected: bool,
+        hand_center_pixels: tuple[int, int] | None,
         confirmed_gesture: str | None,
     ) -> None:
         """Write all 0.25-second samples that are due at the current time."""
@@ -418,6 +525,16 @@ class HandDataRecorder:
                     self.sample_number,
                     f"{elapsed_seconds:.2f}",
                     "YES" if hand_detected else "NO",
+                    (
+                        hand_center_pixels[0]
+                        if hand_center_pixels is not None
+                        else ""
+                    ),
+                    (
+                        hand_center_pixels[1]
+                        if hand_center_pixels is not None
+                        else ""
+                    ),
                     position,
                     "YES" if position == "OPEN" else "NO",
                     "YES" if position == "FIST" else "NO",
@@ -432,21 +549,54 @@ class HandDataRecorder:
         # Flush every update so collected data survives an unexpected shutdown.
         self.file.flush()
 
-    def stop(self) -> None:
-        """Flush and close the active CSV session."""
+    def record_video_frame_if_due(
+        self,
+        current_time: float,
+        frame,
+    ) -> None:
+        """Write fully annotated UI frames on a constant real-time clock."""
 
-        if not self.is_recording:
-            print("Data recording is not active.")
+        if not self.is_recording or self.video_writer is None or frame is None:
             return
 
-        output_path = self.output_path
+        # Writing against a clock keeps MP4 playback duration aligned with CSV
+        # elapsed time. A slow camera loop repeats the latest frame; a fast loop
+        # skips frames until the next 1 / VIDEO_RECORDING_FPS time boundary.
+        while current_time >= self.next_video_frame_at:
+            self.video_writer.write(frame)
+            self.video_frame_count += 1
+            self.next_video_frame_at = (
+                self.started_at
+                + self.video_frame_count / VIDEO_RECORDING_FPS
+            )
+
+    def stop(self) -> None:
+        """Flush and close both files in the active recording session."""
+
+        if not self.is_recording:
+            print("CSV and video recording are not active.")
+            return
+
+        csv_output_path = self.output_path
+        video_output_path = self.video_output_path
         row_count = self.sample_number
+        video_frame_count = self.video_frame_count
         self.file.flush()
         self.file.close()
+        if self.video_writer is not None:
+            self.video_writer.release()
         self.file = None
         self.writer = None
         self.output_path = None
-        print(f"Stopped recording. Saved {row_count} rows to: {output_path}")
+        self.video_writer = None
+        self.video_output_path = None
+        video_duration = video_frame_count / VIDEO_RECORDING_FPS
+        print("Stopped synchronized recording:")
+        print(f"  Data:  {row_count} rows -> {csv_output_path}")
+        print(
+            f"  Video: {video_frame_count} frames / "
+            f"{video_duration:.2f} s -> {video_output_path}"
+        )
 
 
 def draw_status(
@@ -455,10 +605,11 @@ def draw_status(
     handedness: str,
     raw_gesture: str,
     confirmed_gesture: str | None,
+    hand_center_pixels: tuple[int, int] | None,
     recorder: HandDataRecorder,
     fps: float,
 ) -> None:
-    """Draw hand state, gesture state, recording state, and FPS."""
+    """Draw hand, gesture, position, recording, and FPS information."""
 
     if hand_detected:
         if confirmed_gesture is not None:
@@ -486,13 +637,14 @@ def draw_status(
         cv2.LINE_AA,
     )
     recording_status = (
-        f"RECORDING CSV - {recorder.sample_number} samples"
+        f"RECORDING CSV + VIDEO - {recorder.sample_number} samples / "
+        f"{recorder.video_frame_count} frames"
         if recorder.is_recording
-        else "CSV NOT RECORDING - press R to start"
+        else "CSV + VIDEO NOT RECORDING - press R to start"
     )
     recording_color = (0, 0, 255) if recorder.is_recording else color
 
-    # Second line: CSV recording state.
+    # Second line: synchronized CSV and MP4 recording state.
     cv2.putText(
         frame,
         recording_status,
@@ -504,11 +656,30 @@ def draw_status(
         cv2.LINE_AA,
     )
 
-    # Third line: smoothed processing speed.
+    position_text = (
+        f"PALM CENTER: X={hand_center_pixels[0]} px, "
+        f"Y={hand_center_pixels[1]} px (origin: bottom-left)"
+        if hand_center_pixels is not None
+        else "PALM CENTER: -- (origin: bottom-left)"
+    )
+
+    # Third line: current uncalibrated camera-pixel position.
+    cv2.putText(
+        frame,
+        position_text,
+        (20, 101),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+
+    # Fourth line: smoothed processing speed.
     cv2.putText(
         frame,
         f"FPS: {fps:.1f}",
-        (20, 101),
+        (20, 134),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.62,
         color,
@@ -540,6 +711,7 @@ def main() -> None:
     frame = None
     latest_result = None
     hand_detected = False
+    hand_center_pixels: tuple[int, int] | None = None
     raw_gesture = "UNKNOWN"
     candidate_gesture = "UNKNOWN"
     candidate_since = time.monotonic()
@@ -597,6 +769,12 @@ def main() -> None:
 
                     if hand_detected:
                         hand_landmarks = latest_result.hand_landmarks[0]
+                        frame_height, frame_width = frame.shape[:2]
+                        hand_center_pixels = calculate_hand_center_pixels(
+                            hand_landmarks,
+                            frame_width,
+                            frame_height,
+                        )
                         raw_gesture = classify_hand_gesture(hand_landmarks)
                         gesture_time = time.monotonic()
                         (
@@ -612,6 +790,7 @@ def main() -> None:
 
                     else:
                         # Reset gesture confirmation when the hand leaves.
+                        hand_center_pixels = None
                         raw_gesture = "UNKNOWN"
                         candidate_gesture = "UNKNOWN"
                         candidate_since = time.monotonic()
@@ -628,17 +807,21 @@ def main() -> None:
                                 0.90 * smoothed_fps + 0.10 * current_fps
                             )
 
-                # The recorder uses its own clock, so CSV rows stay spaced at
-                # 0.25 seconds even though camera FPS varies.
+                # CSV samples and MP4 frames share the same monotonic session
+                # clock, keeping the saved data and video aligned even when
+                # camera-processing FPS varies.
+                recording_time = time.monotonic()
                 recorder.record_if_due(
-                    time.monotonic(),
+                    recording_time,
                     hand_detected,
+                    hand_center_pixels,
                     confirmed_gesture,
                 )
 
                 # Display --------------------------------------------------
                 if frame is not None:
-                    # Draw on a copy so the original camera frame stays clean.
+                    # This annotated copy is shown live and saved to the MP4,
+                    # while the original mirrored camera frame remains clean.
                     display_frame = frame.copy()
                     hand_detected = bool(
                         latest_result and latest_result.hand_landmarks
@@ -659,14 +842,25 @@ def main() -> None:
                             for landmarks in latest_result.hand_landmarks:
                                 draw_hand_landmarks(display_frame, landmarks)
 
+                        if hand_center_pixels is not None:
+                            draw_hand_center(
+                                display_frame,
+                                hand_center_pixels,
+                            )
+
                     draw_status(
                         display_frame,
                         hand_detected,
                         handedness,
                         raw_gesture,
                         confirmed_gesture,
+                        hand_center_pixels,
                         recorder,
                         smoothed_fps,
+                    )
+                    recorder.record_video_frame_if_due(
+                        recording_time,
+                        display_frame,
                     )
                     cv2.imshow("MediaPipe Hand Tracker", display_frame)
 
@@ -687,7 +881,10 @@ def main() -> None:
                     )
 
                 elif key == START_RECORDING_KEY:
-                    recorder.start()
+                    try:
+                        recorder.start(frame)
+                    except (OSError, RuntimeError) as error:
+                        print(f"Could not start recording: {error}")
 
                 elif key == STOP_RECORDING_KEY:
                     recorder.stop()

@@ -108,13 +108,55 @@ tested controllers with speed limits, safety checks, and recovery behavior.
 
 The current repository contains a lightweight MediaPipe hand-tracking program.
 It opens a camera feed, mirrors the image, tracks 21 hand landmarks, marks the
-wrist and fingertips, reports handedness, and recognizes an open hand or fist.
-A gesture must remain stable for 0.5 seconds before it is confirmed.
+wrist, fingertips, and palm center, reports handedness, and recognizes an open
+hand or fist. A gesture must remain stable for 0.5 seconds before it is
+confirmed.
 
-The user can start and stop a CSV data session from the camera window. While
-recording, the program writes a sample every 0.25 seconds containing elapsed
-time, whether a hand was detected, its confirmed position, and explicit
-open/fist yes-or-no values. Files are saved under `hand_tracking_data/`.
+The user can start and stop a synchronized data-and-video session from the
+camera window. Every session produces a timestamp-matched pair under
+`hand_tracking_data/`: a CSV such as `hand_tracking_...csv` and its mirrored
+annotated camera video `hand_tracking_...mp4`. The saved video includes the
+hand skeleton, palm-center dot, gesture and detection status, position values,
+recording counters, and FPS exactly as shown in the live window.
+
+The CSV writes a sample every 0.25 seconds containing elapsed time, whether a
+hand was detected, the palm-center X and Y camera-pixel coordinates, its
+confirmed gesture, and explicit open/fist yes-or-no values. The uncalibrated
+coordinate origin is the bottom-left of the displayed camera frame: X increases
+to the right and Y increases upward. Position cells remain blank when no hand
+is detected. The MP4 uses a fixed real-time frame clock so its duration remains
+aligned with CSV elapsed time even when processing FPS changes.
+
+### Interactive path and movement visualization
+
+`VisualizeHandTracking.py` converts a coordinate CSV into an interactive HTML
+report with two synchronized panels:
+
+- A time-colored X/Y hand path with raw and smoothed traces
+- Direction arrows whose length and shaft thickness increase with velocity;
+  marker color also represents speed in pixels per second
+
+Hover over a point to inspect its time, position, speed, and gesture. Use the
+legend to show or hide the raw path, the mouse to zoom or pan, and the slider or
+Play button to move through the recording. Detection gaps remain disconnected,
+so the report does not invent movement while the hand is missing.
+
+Create a report from the newest compatible coordinate CSV:
+
+```powershell
+& ".\.venv\Scripts\python.exe" ".\VisualizeHandTracking.py" --open
+```
+
+Or select a particular recording:
+
+```powershell
+& ".\.venv\Scripts\python.exe" ".\VisualizeHandTracking.py" `
+    ".\hand_tracking_data\hand_tracking_YYYYMMDD_HHMMSS.csv" --open
+```
+
+Reports are saved under `hand_tracking_visuals/`. They work offline and can
+export either panel to PNG from Plotly's camera button. The newest-file search
+automatically ignores older CSVs that do not contain X/Y position columns.
 
 This prototype develops the real-time perception and video-pipeline foundation
 needed for later gesture commands, recording control, full-body tracking, and
@@ -142,8 +184,8 @@ Controls:
 | --- | --- |
 | `L` | Show or hide hand landmarks |
 | `P` | Pause or resume the camera |
-| `R` | Start a new CSV recording session |
-| `S` | Stop and save the active CSV session |
+| `R` | Start synchronized CSV and MP4 recording |
+| `S` | Stop and save both recording files |
 | `Q` | Quit |
 
 ## Development roadmap

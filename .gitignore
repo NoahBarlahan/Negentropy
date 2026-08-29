@@ -7,6 +7,7 @@ __pycache__/
 
 # Runtime hand-tracking datasets (may contain personal activity data)
 hand_tracking_data/
+hand_tracking_visuals/
 
 # Editor and operating-system files
 .vscode/
