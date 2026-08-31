@@ -234,6 +234,42 @@ Controls:
 | `C` | Center the servo at 90° |
 | `Q` | Center the servo and quit |
 
+### Mega and A4988 stepper prototype
+
+`StepperHandTrackingMega/StepperHandTrackingMega.ino` is an upload-ready
+Arduino Mega sketch for a full-step NEMA 17 controlled through an A4988. The
+computer remains responsible for MediaPipe detection; the Mega receives the
+same default `0–180` numeric hand-position values, smooths and calibrates them
+to `0–360°`, and selects the nearest equivalent target among 200 full steps.
+
+Install **AccelStepper** from Arduino IDE's Library Manager before compiling.
+The sketch uses non-blocking `moveTo()` and repeated `run()` calls for
+acceleration and deceleration.
+
+Wiring:
+
+- Mega pin 32 to A4988 DIR
+- Mega pin 34 to A4988 STEP
+- A4988 RESET and SLEEP together to Mega 5V
+- Separate A4988 motor power with ground connected to Mega ground
+- MS1, MS2, and MS3 low for full-step mode
+
+At 9600 baud with a newline ending, send `g` to enable tracking, `s` to disable
+and decelerate, and numeric hand values such as `0`, `90`, or `180`. Before `g`,
+numeric values are ignored and the motor remains still. The main tuning values
+are `STEPS_PER_REVOLUTION`, `MAX_SPEED_STEPS_PER_SECOND`,
+`ACCELERATION_STEPS_PER_SECOND_SQUARED`, `HAND_INPUT_MINIMUM`,
+`HAND_INPUT_MAXIMUM`, and `HAND_SMOOTHING_ALPHA`.
+
+The startup position of 0 steps is only a software assumption. The Mega and
+A4988 cannot know the physical shaft position after power loss; add a limit
+switch or homing sensor before relying on repeatable absolute orientation.
+
+Arduino Serial Monitor and the Python tracker cannot own the USB serial port at
+the same time. Use Serial Monitor for manual `g` and numeric-value tests. For
+camera integration, close Serial Monitor and have the computer send `g\n` once
+after opening the port, followed by the numeric hand values.
+
 | Phase | System | End goal |
 | --- | --- | --- |
 | **1** | Smart fixed camera | Detect activities and automatically save complete clips with metadata |
