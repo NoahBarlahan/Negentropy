@@ -1,15 +1,21 @@
 """Follow a detected hand's center with a two-axis camera mount.
 
-Following arms automatically when the program starts. Type ``d`` or ``s`` to
-disarm and stop, or ``a`` to re-arm. Close Arduino IDE's Serial Monitor first.
+Press ``I`` at the gravity-resting pose to initialize Y and arm following.
+Type ``d`` or ``s`` to disarm and stop, or ``a`` to re-arm. Close Arduino
+IDE's Serial Monitor first. A PyQtGraph dashboard opens in a separate process.
 """
 
 from pathlib import Path
-from queue import Empty, Queue
+from multiprocessing import Event as ProcessEvent, Process, Queue as ProcessQueue, freeze_support
+from queue import Empty, Full, Queue
+import csv
+from datetime import datetime
 import math
 import re
 import threading
 import time
+
+from PIDLiveDashboard import run_dashboard
 
 try:
     import cv2
@@ -33,37 +39,52 @@ MIRROR_IMAGE = True
 SERIAL_PORT: str | None = None  # Set to something like "COM5" if needed.
 SERIAL_BAUD_RATE = 9600
 ARDUINO_RESET_WAIT_SECONDS = 2.0
-AUTO_FOLLOW_ON_START = True
+AUTO_FOLLOW_ON_START = False
+ASSUMED_READY_Z_DEGREES = 0.0
+ASSUMED_READY_Y_DEGREES = -50.0
 
 # Hand-center follower tuning
 # Use your camera's real field-of-view specifications when known.
 HORIZONTAL_FIELD_OF_VIEW_DEGREES = 70.0
 VERTICAL_FIELD_OF_VIEW_DEGREES = 43.0
-CENTER_DEADBAND_X_NORMALIZED = 0.04
-CENTER_DEADBAND_Y_NORMALIZED = 0.04
-HAND_CENTER_SMOOTHING = 0.25
+CENTER_DEADBAND_X_NORMALIZED = 0.05
+CENTER_DEADBAND_Y_NORMALIZED = 0.05
+HAND_CENTER_SMOOTHING = 0.12
 HAND_CONFIRMATION_SECONDS = 0.50
 NO_HAND_STOP_SECONDS = 0.50
-CONTROL_FREQUENCY_HZ = 12.0
+CONTROL_FREQUENCY_HZ = 20.0
 CONTROL_INTERVAL_SECONDS = 1.0 / CONTROL_FREQUENCY_HZ
 
-# PI output is a requested angular velocity. P reacts to current angular error;
-# I accumulates persistent error so the mount continues through friction/load.
-PROPORTIONAL_GAIN = 0.90
-INTEGRAL_GAIN = 0.20
-INTEGRAL_LIMIT_DEGREE_SECONDS = 30.0
-MAX_TRACKING_SPEED_DEGREES_PER_SECOND = 18.0
+# PID TUNING ---------------------------------------------------------------
+# Z is horizontal/X and Y is vertical/Y. Each axis has an independent PID so
+# it can be tuned for its different mass, gearing, friction, and balance.
+Z_PROPORTIONAL_GAIN = 0.65
+Z_INTEGRAL_GAIN = 0.05
+Z_DERIVATIVE_GAIN = 0.08
+Y_PROPORTIONAL_GAIN = 0.65
+Y_INTEGRAL_GAIN = 0.05
+Y_DERIVATIVE_GAIN = 0.08
+DERIVATIVE_FILTER_ALPHA = 0.08  # Lower = smoother/less noise; range 0..1.
+INTEGRAL_LIMIT_DEGREE_SECONDS = 15.0
+MAX_TRACKING_SPEED_DEGREES_PER_SECOND = 22.0
 
 # There is no cumulative angle/travel limit. This only caps one update so a
 # bad detection cannot request one huge motion.
-MAX_CORRECTION_DEGREES_PER_UPDATE = 2.0
+MAX_CORRECTION_DEGREES_PER_UPDATE = 1.25
 MIN_CORRECTION_DEGREES = 0.05
 
-# Z direction is learned after arming. Hold the hand still and clearly left or
-# right while the camera makes this small test motion.
-Z_DIRECTION_CALIBRATION_MIN_ERROR_PIXELS = 70.0
-Z_DIRECTION_EVALUATION_SECONDS = 0.75
-Z_DIRECTION_IMPROVEMENT_THRESHOLD_PIXELS = 12.0
+# CSV recording
+CSV_OUTPUT_DIRECTORY = Path(__file__).with_name("pid_tracking_data")
+CSV_RECORD_FREQUENCY_HZ = CONTROL_FREQUENCY_HZ
+CSV_RECORD_INTERVAL_SECONDS = 1.0 / CSV_RECORD_FREQUENCY_HZ
+START_RECORDING_KEYS = {ord("r"), ord("R")}
+STOP_RECORDING_KEYS = {ord("t"), ord("T")}
+INITIALIZE_Y_KEYS = {ord("i"), ord("I")}
+
+# Fixed Z direction for immediate full horizontal PID control. Earlier tests
+# showed that the original +1 direction increased error on this mechanism.
+# Change this to +1.0 only if Z moves horizontally away from the hand.
+Z_DIRECTION_SIGN = -1.0
 
 # MediaPipe settings
 HAND_MODEL_PATH = Path(__file__).with_name("hand_landmarker.task")
@@ -113,17 +134,22 @@ def print_controls(port_name: str) -> None:
     print("TWO-AXIS HAND-CENTER FOLLOWER")
     print("=" * 62)
     print(f"Arduino Mega: {port_name} at {SERIAL_BAUD_RATE} baud")
-    print("AUTOMATIC FOLLOWING STARTS ARMED.")
+    print("STARTUP: press I once at the gravity-resting pose.")
+    print("I labels current Y=+60, moves to Y=-50, then arms tracking.")
     print("  a      Arm automatic hand following")
     print("  d/s    Disarm following and smoothly stop")
     print("  z10    Manually set absolute Z to +10 degrees")
     print("  y-50   Manually set absolute Y to -50 degrees")
     print("  p      Print Arduino software positions")
     print("  zero   Declare the stationary pose Z=0, Y=0")
+    print("  i      Initialize Y from gravity rest, then arm tracking")
+    print(f"  r      Start a new {CSV_RECORD_FREQUENCY_HZ:.0f} Hz PID CSV recording")
+    print("  t      Stop and save the CSV recording")
     print("  h      Arduino help     q  Quit")
-    print("Camera window: L landmarks, P pause, Q quit")
+    print("Camera window: I initialize, L landmarks, P pause, R record, T save, Q quit")
     print("-" * 62)
-    print("NO software travel limits. Startup zero is assumed, not measured.")
+    print("NO software travel limits or encoder feedback.")
+    print("Arduino assumes gravity rest is Y=+60, then moves to Y=-50.")
     print("Before arming, ensure both axes can move without a collision.")
     print("For the initial Z test, hold your off-center hand still.")
     print("Known direction: negative Y moves the camera upward.")
@@ -177,12 +203,48 @@ class ArduinoConnection:
         self.position_received = False
         self.z_position_degrees: float | None = None
         self.y_position_degrees: float | None = None
+        self.z_velocity_estimate = 0.0
+        self.y_velocity_estimate = 0.0
+        self.z_acceleration_estimate = 0.0
+        self.y_acceleration_estimate = 0.0
+        self.last_position_sample_time: float | None = None
+        self.previous_z_position: float | None = None
+        self.previous_y_position: float | None = None
         self.z_moving = False
         self.y_moving = False
+        self.y_completion_count = 0
         self.receive_buffer = bytearray()
         time.sleep(ARDUINO_RESET_WAIT_SECONDS)
         self.connection.reset_input_buffer()
         self.send_command("p")
+
+    def update_position_estimates(self, z_position: float, y_position: float) -> None:
+        """Estimate velocity and acceleration from Arduino position reports."""
+
+        now = time.monotonic()
+        if (
+            self.last_position_sample_time is not None
+            and self.previous_z_position is not None
+            and self.previous_y_position is not None
+        ):
+            dt = now - self.last_position_sample_time
+            if dt > 0.001:
+                new_z_velocity = (z_position - self.previous_z_position) / dt
+                new_y_velocity = (y_position - self.previous_y_position) / dt
+                self.z_acceleration_estimate = (
+                    new_z_velocity - self.z_velocity_estimate
+                ) / dt
+                self.y_acceleration_estimate = (
+                    new_y_velocity - self.y_velocity_estimate
+                ) / dt
+                self.z_velocity_estimate = new_z_velocity
+                self.y_velocity_estimate = new_y_velocity
+        self.z_position_degrees = z_position
+        self.y_position_degrees = y_position
+        self.previous_z_position = z_position
+        self.previous_y_position = y_position
+        self.last_position_sample_time = now
+        self.position_received = True
 
     def send_command(self, command: str) -> None:
         if not self.connection.is_open:
@@ -211,15 +273,19 @@ class ArduinoConnection:
             self.last_response_time = time.monotonic()
             match = POSITION_RESPONSE_PATTERN.fullmatch(line)
             if match:
-                self.z_position_degrees = float(match.group(1))
-                self.y_position_degrees = float(match.group(2))
-                self.position_received = True
+                self.update_position_estimates(
+                    float(match.group(1)), float(match.group(2))
+                )
             elif match := LEGACY_Z_POSITION_PATTERN.match(line):
                 self.z_position_degrees = float(match.group(1))
                 self.position_received = self.y_position_degrees is not None
             elif match := LEGACY_Y_POSITION_PATTERN.match(line):
                 self.y_position_degrees = float(match.group(1))
                 self.position_received = self.z_position_degrees is not None
+                if self.position_received:
+                    self.update_position_estimates(
+                        self.z_position_degrees, self.y_position_degrees
+                    )
             elif line.startswith("ACK "):
                 self.last_acknowledgement_time = time.monotonic()
                 self.first_unacknowledged_motion_time = None
@@ -227,6 +293,7 @@ class ArduinoConnection:
                 self.z_moving = False
             elif line == "DONE Y":
                 self.y_moving = False
+                self.y_completion_count += 1
             # Older 9600-baud firmware does not use the new ACK prefix. Any
             # readable line still confirms that serial communication works.
             if self.first_unacknowledged_motion_time is not None:
@@ -250,6 +317,12 @@ def normalize_terminal_command(raw: str) -> tuple[str | None, str]:
         return "__arm__", ""
     if command == "d":
         return "__disarm__", ""
+    if command == "r":
+        return "__start_recording__", ""
+    if command == "t":
+        return "__stop_recording__", ""
+    if command == "i":
+        return "__initialize_y__", ""
     if command in {"s", "p", "h", "zero"}:
         return command, ""
     match = AXIS_COMMAND_PATTERN.fullmatch(command)
@@ -328,10 +401,10 @@ def clamp(value: float, maximum: float) -> float:
 
 
 class HandCenterFollower:
-    """Run a 12 Hz PI position-error controller for both camera axes."""
+    """Run a filtered PID position-error controller for both axes."""
 
     def __init__(self) -> None:
-        self.z_direction_sign = 1.0
+        self.z_direction_sign = Z_DIRECTION_SIGN
         self.reset(time.monotonic(), True)
 
     def reset(self, now: float, reset_direction: bool = False) -> None:
@@ -345,22 +418,21 @@ class HandCenterFollower:
         self.error_x_pixels = self.error_y_pixels = 0.0
         self.horizontal_angle_error = self.vertical_angle_error = 0.0
         self.z_integral = self.y_integral = 0.0
+        self.previous_horizontal_error: float | None = None
+        self.previous_vertical_error: float | None = None
+        self.z_derivative = self.y_derivative = 0.0
+        self.z_p_term = self.z_i_term = self.z_d_term = 0.0
+        self.y_p_term = self.y_i_term = self.y_d_term = 0.0
         self.z_velocity = self.y_velocity = 0.0
         self.z_target: float | None = None
         self.y_target: float | None = None
-        self.z_check_started_at: float | None = None
-        self.z_check_initial_error_pixels = 0.0
         if reset_direction:
-            self.z_direction_sign = 1.0
-            self.z_direction_verified = False
+            self.z_direction_sign = Z_DIRECTION_SIGN
+            self.z_direction_verified = True
 
     @property
     def z_direction_text(self) -> str:
-        if self.z_check_started_at is not None:
-            return "CHECKING WHILE MOVING"
-        if not self.z_direction_verified:
-            return "UNVERIFIED"
-        return "NORMAL" if self.z_direction_sign > 0 else "REVERSED"
+        return "FIXED +Z" if self.z_direction_sign > 0 else "FIXED -Z"
 
     def update(self, center, width: int, height: int, now: float, armed: bool, arduino: ArduinoConnection) -> None:
         if not armed:
@@ -371,8 +443,10 @@ class HandCenterFollower:
                 self.no_hand_since = now
             self.hand_seen_since = None
             self.filtered_center = None
-            self.z_check_started_at = None
             self.z_integral = self.y_integral = 0.0
+            self.previous_horizontal_error = None
+            self.previous_vertical_error = None
+            self.z_derivative = self.y_derivative = 0.0
             self.z_velocity = self.y_velocity = 0.0
             self.status = "HAND LOST"
             if now - self.no_hand_since >= NO_HAND_STOP_SECONDS and not self.stop_sent:
@@ -419,9 +493,17 @@ class HandCenterFollower:
         # telemetry has not arrived, command from that same documented zero
         # instead of blocking forever in a WAITING state.
         if self.z_target is None:
-            self.z_target = arduino.z_position_degrees or 0.0
+            self.z_target = (
+                ASSUMED_READY_Z_DEGREES
+                if arduino.z_position_degrees is None
+                else arduino.z_position_degrees
+            )
         if self.y_target is None:
-            self.y_target = arduino.y_position_degrees or 0.0
+            self.y_target = (
+                ASSUMED_READY_Y_DEGREES
+                if arduino.y_position_degrees is None
+                else arduino.y_position_degrees
+            )
 
         x_active = abs(self.error_x) > CENTER_DEADBAND_X_NORMALIZED
         y_active = abs(self.error_y) > CENTER_DEADBAND_Y_NORMALIZED
@@ -440,11 +522,35 @@ class HandCenterFollower:
         else:
             self.y_integral = 0.0
 
+        raw_z_derivative = (
+            0.0
+            if self.previous_horizontal_error is None
+            else (self.horizontal_angle_error - self.previous_horizontal_error) / dt
+        )
+        raw_y_derivative = (
+            0.0
+            if self.previous_vertical_error is None
+            else (self.vertical_angle_error - self.previous_vertical_error) / dt
+        )
+        alpha = DERIVATIVE_FILTER_ALPHA
+        self.z_derivative += alpha * (raw_z_derivative - self.z_derivative)
+        self.y_derivative += alpha * (raw_y_derivative - self.y_derivative)
+        self.previous_horizontal_error = self.horizontal_angle_error
+        self.previous_vertical_error = self.vertical_angle_error
+
+        # Z consumes horizontal/X error; Y consumes vertical/Y error. Both run
+        # complete and independent P + I + filtered-D calculations every tick.
+        self.z_p_term = Z_PROPORTIONAL_GAIN * self.horizontal_angle_error
+        self.z_i_term = Z_INTEGRAL_GAIN * self.z_integral
+        self.z_d_term = Z_DERIVATIVE_GAIN * self.z_derivative
+        self.y_p_term = Y_PROPORTIONAL_GAIN * self.vertical_angle_error
+        self.y_i_term = Y_INTEGRAL_GAIN * self.y_integral
+        self.y_d_term = Y_DERIVATIVE_GAIN * self.y_derivative
+
         self.z_velocity = (
             self.z_direction_sign
             * clamp(
-                PROPORTIONAL_GAIN * self.horizontal_angle_error
-                + INTEGRAL_GAIN * self.z_integral,
+                self.z_p_term + self.z_i_term + self.z_d_term,
                 MAX_TRACKING_SPEED_DEGREES_PER_SECOND,
             )
             if x_active else 0.0
@@ -453,8 +559,7 @@ class HandCenterFollower:
         # velocity, matching the known mechanism direction: -Y is upward.
         self.y_velocity = (
             clamp(
-                PROPORTIONAL_GAIN * self.vertical_angle_error
-                + INTEGRAL_GAIN * self.y_integral,
+                self.y_p_term + self.y_i_term + self.y_d_term,
                 MAX_TRACKING_SPEED_DEGREES_PER_SECOND,
             )
             if y_active else 0.0
@@ -478,26 +583,126 @@ class HandCenterFollower:
                 arduino.send_command(f"y{self.y_target:.3f}")
                 sent = True
 
-        # Check Z direction during normal PI motion instead of blocking motion
-        # for a separate calibration. Hold the hand reasonably still while
-        # UNVERIFIED/CHECKING is displayed.
-        if not self.z_direction_verified and abs(self.error_x_pixels) >= Z_DIRECTION_CALIBRATION_MIN_ERROR_PIXELS:
-            if self.z_check_started_at is None:
-                self.z_check_started_at = now
-                self.z_check_initial_error_pixels = abs(self.error_x_pixels)
-            elif now - self.z_check_started_at >= Z_DIRECTION_EVALUATION_SECONDS:
-                change = abs(self.error_x_pixels) - self.z_check_initial_error_pixels
-                self.z_check_started_at = None
-                if change > Z_DIRECTION_IMPROVEMENT_THRESHOLD_PIXELS:
-                    self.z_direction_sign *= -1.0
-                    self.z_integral = 0.0
-                    self.z_direction_verified = True
-                    print("Horizontal error increased: Z direction automatically reversed.")
-                elif change < -Z_DIRECTION_IMPROVEMENT_THRESHOLD_PIXELS:
-                    self.z_direction_verified = True
-                    print("Horizontal error decreased: Z direction confirmed.")
+        self.status = (
+            f"FULL Z(X) + Y(Y) PID AT {CONTROL_FREQUENCY_HZ:.0f} HZ"
+            if sent else "CENTERED"
+        )
 
-        self.status = "PI FOLLOWING AT 12 HZ" if sent else "CENTERED"
+
+class PIDDataRecorder:
+    """Write controller inputs, PID terms, and motor telemetry at control rate."""
+
+    FIELDNAMES = (
+        "timestamp_iso", "elapsed_seconds", "hand_detected", "following_armed",
+        "hand_x_pixels", "hand_y_pixels_top", "hand_y_pixels_bottom",
+        "x_error_pixels", "y_error_pixels", "pixel_error_distance",
+        "horizontal_angle_error_degrees", "vertical_angle_error_degrees",
+        "z_p_term", "z_i_term", "z_d_term", "z_pid_velocity_command_deg_s",
+        "y_p_term", "y_i_term", "y_d_term", "y_pid_velocity_command_deg_s",
+        "z_target_degrees", "y_target_degrees",
+        "z_reported_position_degrees", "y_reported_position_degrees",
+        "z_estimated_velocity_deg_s", "y_estimated_velocity_deg_s",
+        "z_estimated_acceleration_deg_s2", "y_estimated_acceleration_deg_s2",
+        "z_direction_sign", "arduino_position_received", "last_arduino_command",
+        "camera_fps",
+    )
+
+    def __init__(self) -> None:
+        self.file = None
+        self.writer = None
+        self.path: Path | None = None
+        self.started_at = 0.0
+        self.last_record_time = 0.0
+        self.row_count = 0
+
+    @property
+    def recording(self) -> bool:
+        return self.file is not None
+
+    def start(self) -> None:
+        if self.recording:
+            print(f"CSV recording is already active: {self.path}")
+            return
+        CSV_OUTPUT_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        self.path = CSV_OUTPUT_DIRECTORY / f"pid_tracking_{timestamp}.csv"
+        self.file = self.path.open("w", newline="", encoding="utf-8")
+        self.writer = csv.DictWriter(self.file, fieldnames=self.FIELDNAMES)
+        self.writer.writeheader()
+        self.started_at = time.monotonic()
+        self.last_record_time = 0.0
+        self.row_count = 0
+        print(f"CSV recording STARTED: {self.path}")
+
+    def stop(self) -> Path | None:
+        if not self.recording:
+            print("CSV recording is not active.")
+            return self.path
+        self.file.flush()
+        self.file.close()
+        saved_path = self.path
+        self.file = None
+        self.writer = None
+        print(f"CSV recording SAVED ({self.row_count} rows): {saved_path}")
+        return saved_path
+
+    def maybe_record(
+        self,
+        now: float,
+        hand_detected: bool,
+        armed: bool,
+        follower: HandCenterFollower,
+        arduino: ArduinoConnection,
+        frame_width: int,
+        frame_height: int,
+        fps: float,
+    ) -> None:
+        if not self.recording or now - self.last_record_time < CSV_RECORD_INTERVAL_SECONDS:
+            return
+        self.last_record_time = now
+        if follower.filtered_center is None:
+            hand_x = hand_y_top = hand_y_bottom = ""
+        else:
+            hand_x = follower.filtered_center[0] * frame_width
+            hand_y_top = follower.filtered_center[1] * frame_height
+            hand_y_bottom = frame_height - hand_y_top
+        self.writer.writerow({
+            "timestamp_iso": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            "elapsed_seconds": now - self.started_at,
+            "hand_detected": hand_detected,
+            "following_armed": armed,
+            "hand_x_pixels": hand_x,
+            "hand_y_pixels_top": hand_y_top,
+            "hand_y_pixels_bottom": hand_y_bottom,
+            "x_error_pixels": follower.error_x_pixels,
+            "y_error_pixels": follower.error_y_pixels,
+            "pixel_error_distance": math.hypot(follower.error_x_pixels, follower.error_y_pixels),
+            "horizontal_angle_error_degrees": follower.horizontal_angle_error,
+            "vertical_angle_error_degrees": follower.vertical_angle_error,
+            "z_p_term": follower.z_p_term,
+            "z_i_term": follower.z_i_term,
+            "z_d_term": follower.z_d_term,
+            "z_pid_velocity_command_deg_s": follower.z_velocity,
+            "y_p_term": follower.y_p_term,
+            "y_i_term": follower.y_i_term,
+            "y_d_term": follower.y_d_term,
+            "y_pid_velocity_command_deg_s": follower.y_velocity,
+            "z_target_degrees": "" if follower.z_target is None else follower.z_target,
+            "y_target_degrees": "" if follower.y_target is None else follower.y_target,
+            "z_reported_position_degrees": "" if arduino.z_position_degrees is None else arduino.z_position_degrees,
+            "y_reported_position_degrees": "" if arduino.y_position_degrees is None else arduino.y_position_degrees,
+            "z_estimated_velocity_deg_s": arduino.z_velocity_estimate,
+            "y_estimated_velocity_deg_s": arduino.y_velocity_estimate,
+            "z_estimated_acceleration_deg_s2": arduino.z_acceleration_estimate,
+            "y_estimated_acceleration_deg_s2": arduino.y_acceleration_estimate,
+            "z_direction_sign": follower.z_direction_sign,
+            "arduino_position_received": arduino.position_received,
+            "last_arduino_command": arduino.last_command,
+            "camera_fps": fps,
+        })
+        self.row_count += 1
+        if self.row_count % 12 == 0:
+            self.file.flush()
 
 
 def draw_target(frame, follower: HandCenterFollower) -> None:
@@ -511,7 +716,7 @@ def draw_target(frame, follower: HandCenterFollower) -> None:
 
     # These arrows show the screen direction the mount is being asked to turn.
     # Their lengths represent pixel error and their thickness represents the
-    # requested PI velocity. They remain useful even without Arduino feedback.
+    # requested PID velocity. They remain useful without Arduino feedback.
     if abs(follower.error_x_pixels) > dx:
         arrow_x = int(math.copysign(min(190, max(45, abs(follower.error_x_pixels))), follower.error_x_pixels))
         thickness = 2 + round(4 * abs(follower.z_velocity) / MAX_TRACKING_SPEED_DEGREES_PER_SECOND)
@@ -522,9 +727,9 @@ def draw_target(frame, follower: HandCenterFollower) -> None:
         cv2.arrowedLine(frame, (cx, cy), (cx, cy + arrow_y), (255, 0, 255), thickness, cv2.LINE_AA, tipLength=0.18)
 
 
-def draw_status(frame, hand_detected: bool, follower: HandCenterFollower, armed: bool, arduino: ArduinoConnection, fps: float) -> None:
+def draw_status(frame, hand_detected: bool, follower: HandCenterFollower, armed: bool, initializing: bool, arduino: ArduinoConnection, recorder: PIDDataRecorder, fps: float) -> None:
     position = (
-        "NO REPORT (PI USING STARTUP ZERO)"
+        "NO REPORT (PID USING STARTUP REFERENCE)"
         if not arduino.position_received
         else f"Z={arduino.z_position_degrees:+.2f}  Y={arduino.y_position_degrees:+.2f} deg"
     )
@@ -543,13 +748,15 @@ def draw_status(frame, hand_detected: bool, follower: HandCenterFollower, armed:
         serial_color = WARNING_COLOR
     lines = (
         ("HAND: DETECTED" if hand_detected else "HAND: NOT DETECTED", TEXT_COLOR if hand_detected else WARNING_COLOR),
-        (f"FOLLOW: {'ARMED' if armed else 'DISARMED'}  {follower.status}", TEXT_COLOR if armed else WARNING_COLOR),
+        (("INITIALIZING Y: +60 -> -50" if initializing else f"FOLLOW: {'ARMED' if armed else 'DISARMED'}  {follower.status}"), INFO_COLOR if initializing else (TEXT_COLOR if armed else WARNING_COLOR)),
         (f"PIXEL ERROR: X={follower.error_x_pixels:+.0f}px  Y={follower.error_y_pixels:+.0f}px", INFO_COLOR),
         (f"ANGLE ERROR: X={follower.horizontal_angle_error:+.1f}  Y={follower.vertical_angle_error:+.1f} deg", INFO_COLOR),
-        (f"PI REQUEST: Z={follower.z_velocity:+.1f}  Y={follower.y_velocity:+.1f} deg/s", INFO_COLOR),
+        (f"Z HORIZONTAL PID: P={follower.z_p_term:+.1f} I={follower.z_i_term:+.1f} D={follower.z_d_term:+.1f} OUT={follower.z_velocity:+.1f}", INFO_COLOR),
+        (f"Y VERTICAL PID: P={follower.y_p_term:+.1f} I={follower.y_i_term:+.1f} D={follower.y_d_term:+.1f} OUT={follower.y_velocity:+.1f}", INFO_COLOR),
         (f"Z DIRECTION: {follower.z_direction_text}", INFO_COLOR),
         (f"ARDUINO: {position}", INFO_COLOR),
         (serial_text, serial_color),
+        ((f"CSV: RECORDING {recorder.row_count} rows" if recorder.recording else "CSV: OFF (R=start, T=save)"), (0, 0, 255) if recorder.recording else INFO_COLOR),
         (f"LAST: {arduino.last_command}  PORT: {arduino.port_name}  FPS: {fps:.1f}", INFO_COLOR),
     )
     for index, (text, color) in enumerate(lines):
@@ -581,6 +788,20 @@ def main() -> None:
     previous_frame_time = time.perf_counter()
     fps = 0.0
     follower = HandCenterFollower()
+    initialization_in_progress = False
+    expected_y_completion_count = 0
+    recorder = PIDDataRecorder()
+    dashboard_queue = ProcessQueue(maxsize=100)
+    dashboard_stop_event = ProcessEvent()
+    dashboard_process = Process(
+        target=run_dashboard,
+        args=(dashboard_queue, dashboard_stop_event),
+        daemon=True,
+        name="pid-live-dashboard",
+    )
+    dashboard_process.start()
+    dashboard_started_at = time.monotonic()
+    dashboard_last_publish = 0.0
     if armed:
         print("Following ARMED automatically. Show your hand to the camera.")
         print("Hold it still and off-center briefly while Z learns its direction.")
@@ -607,6 +828,20 @@ def main() -> None:
                         follower.reset(time.monotonic())
                         arduino.send_command("s")
                         print("Following DISARMED.")
+                        continue
+                    if command == "__start_recording__":
+                        recorder.start()
+                        continue
+                    if command == "__stop_recording__":
+                        recorder.stop()
+                        continue
+                    if command == "__initialize_y__":
+                        armed = False
+                        follower.reset(time.monotonic())
+                        initialization_in_progress = True
+                        expected_y_completion_count = arduino.y_completion_count + 1
+                        arduino.send_command("i")
+                        print("Y initialization requested: current pose +60 -> target -50.")
                         continue
                     if command == "s" or command.startswith(("z", "y")):
                         armed = False
@@ -635,8 +870,65 @@ def main() -> None:
                     previous_frame_time = current_time
                     measured = 1 / elapsed if elapsed > 0 else 0
                     fps = measured if fps == 0 else 0.9 * fps + 0.1 * measured
+                    recorder.maybe_record(
+                        time.monotonic(),
+                        center is not None,
+                        armed,
+                        follower,
+                        arduino,
+                        width,
+                        height,
+                        fps,
+                    )
+                    dashboard_time = time.monotonic()
+                    if dashboard_time - dashboard_last_publish >= CONTROL_INTERVAL_SECONDS:
+                        dashboard_last_publish = dashboard_time
+                        dashboard_sample = {
+                            "time": dashboard_time - dashboard_started_at,
+                            "x_error": follower.error_x_pixels,
+                            "y_error": follower.error_y_pixels,
+                            "z_output": follower.z_velocity,
+                            "y_output": follower.y_velocity,
+                            "z_p": follower.z_p_term,
+                            "z_i": follower.z_i_term,
+                            "z_d": follower.z_d_term,
+                            "y_p": follower.y_p_term,
+                            "y_i": follower.y_i_term,
+                            "y_d": follower.y_d_term,
+                            "z_target": 0.0 if follower.z_target is None else follower.z_target,
+                            "y_target": ASSUMED_READY_Y_DEGREES if follower.y_target is None else follower.y_target,
+                            "hand_detected": center is not None,
+                            "serial_ok": arduino.position_received,
+                            "fps": fps,
+                        }
+                        try:
+                            dashboard_queue.put_nowait(dashboard_sample)
+                        except Full:
+                            # Never allow a slow/closed graph window to delay
+                            # camera processing or motor control.
+                            pass
                 else:
                     arduino.read_responses()
+
+                if (
+                    initialization_in_progress
+                    and arduino.y_completion_count >= expected_y_completion_count
+                ):
+                    initialization_in_progress = False
+                    armed = True
+                    follower.reset(time.monotonic(), True)
+                    print("Y initialization complete. Hand following ARMED.")
+                elif (
+                    initialization_in_progress
+                    and arduino.last_response.startswith(("REJECTED:", "INVALID:"))
+                ):
+                    initialization_in_progress = False
+                    print(f"Y initialization failed: {arduino.last_response}")
+                    if arduino.last_response.startswith("INVALID:"):
+                        print(
+                            "The Mega is running outdated firmware without the i command. "
+                            "Quit Python, upload two_axis_pid_controller.ino, then restart."
+                        )
 
                 if frame is not None:
                     display = frame.copy()
@@ -649,7 +941,7 @@ def main() -> None:
                         point = (int(follower.filtered_center[0] * width), int(follower.filtered_center[1] * height))
                         cv2.circle(display, point, 12, PALM_CENTER_COLOR, -1, cv2.LINE_AA)
                         cv2.line(display, (width // 2, height // 2), point, PALM_CENTER_COLOR, 2)
-                    draw_status(display, hand_detected, follower, armed, arduino, fps)
+                    draw_status(display, hand_detected, follower, armed, initialization_in_progress, arduino, recorder, fps)
                     cv2.imshow("Two-Axis Hand-Center Follower", display)
 
                 key = cv2.waitKey(1) & 0xFF
@@ -662,14 +954,37 @@ def main() -> None:
                         follower.reset(time.monotonic())
                         arduino.send_command("s")
                     print("Paused; following disarmed." if paused else "Camera resumed.")
+                elif key in START_RECORDING_KEYS:
+                    recorder.start()
+                elif key in STOP_RECORDING_KEYS:
+                    recorder.stop()
+                elif key in INITIALIZE_Y_KEYS:
+                    armed = False
+                    follower.reset(time.monotonic())
+                    initialization_in_progress = True
+                    expected_y_completion_count = arduino.y_completion_count + 1
+                    arduino.send_command("i")
+                    print("Y initialization requested: current pose +60 -> target -50.")
                 elif key == EXIT_KEY:
                     stop_event.set()
     finally:
         stop_event.set()
+        dashboard_stop_event.set()
+        try:
+            dashboard_queue.put_nowait(None)
+        except Full:
+            pass
+        dashboard_process.join(timeout=2.0)
+        if dashboard_process.is_alive():
+            dashboard_process.terminate()
+            dashboard_process.join(timeout=1.0)
+        if recorder.recording:
+            recorder.stop()
         camera.release()
         cv2.destroyAllWindows()
         arduino.close()
 
 
 if __name__ == "__main__":
+    freeze_support()
     main()
