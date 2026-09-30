@@ -18,3 +18,4 @@ Thumbs.db
 # Previous experiments and local backup copies
 FastSAM-s.pt
 InitialCameraDebug.*backup*
+.history/
