@@ -5,78 +5,91 @@
 #include <string.h>
 
 // ===========================================================================
-// TWO-AXIS CAMERA CONTROLLER FOR HAND-CENTER FOLLOWING
+// TWO-AXIS CAMERA: SAFE, SLOW SERIAL JOG CONTROLLER
 // ===========================================================================
 // Axis assignment:
 //   Z axis / Motor 1: DIR 32, STEP 34
 //   Y axis / Motor 2: DIR 38, STEP 36
 //
-// Commands are absolute software angles and may update while either motor is
-// moving. This lets Python continuously adjust both targets while following a
-// hand. There are intentionally no angular travel limits in this sketch.
-//
 // Serial commands (9600 baud, Newline line ending):
-//   z10     Set the absolute Z target to +10 degrees.
-//   z-10    Set the absolute Z target to -10 degrees.
-//   y5      Set the absolute Y target to +5 degrees.
-//   y-50    Set the absolute Y target to -50 degrees.
-//   s       Stop both axes with AccelStepper deceleration.
-//   p       Print both current software positions.
-//   i       Label current Y=+60, then move Y to -50 degrees.
-//   zero    Declare the stationary current pose to be Z=0 and Y=0.
+//   z10     Move to absolute Z position +10 degrees.
+//   z-10    Move to absolute Z position -10 degrees.
+//   y5      Move to absolute Y position +5 degrees.
+//   y-50    Move to absolute Y position -50 degrees.
+//   s       Smoothly stop the moving axis.
+//   p       Print both software positions.
+//   zero    Declare the current positions to be Z=0 and Y=0. No movement.
 //   h       Print help.
 //
-// WARNING: Software position is open-loop. Without homing switches or
-// encoders, the Mega cannot know its physical position after a restart, stall,
-// skipped step, or manual movement. Use a physical power cutoff during tests.
+// Only one axis may move at a time. Commands outside the configured software
+// limits are rejected. The software limits are useful only if the mechanism is
+// physically placed at its safe center before the Mega starts or is reset.
 
 
-// A4988 pin assignments -----------------------------------------------------
+// ---------------------------------------------------------------------------
+// A4988 pin assignments
+// ---------------------------------------------------------------------------
 const byte Z_DIR_PIN = 32;
 const byte Z_STEP_PIN = 34;
+
 const byte Y_DIR_PIN = 38;
 const byte Y_STEP_PIN = 36;
 
+// AccelStepper::DRIVER uses STEP and DIR. Constructor order is STEP, then DIR.
 AccelStepper zMotor(AccelStepper::DRIVER, Z_STEP_PIN, Z_DIR_PIN);
 AccelStepper yMotor(AccelStepper::DRIVER, Y_STEP_PIN, Y_DIR_PIN);
 
 
-// Resolution and motion ----------------------------------------------------
+// ---------------------------------------------------------------------------
+// Resolution and intentionally slow test motion
+// ---------------------------------------------------------------------------
+// Typical 1.8-degree NEMA 17 motor: 200 full steps per revolution.
 const long FULL_STEPS_PER_REVOLUTION = 200;
+
+// Both A4988 drivers are wired for 1/8 microstepping:
+//   MS1 = HIGH, MS2 = HIGH, MS3 = LOW
 const long MICROSTEPS_PER_FULL_STEP = 8;
 const long STEPS_PER_REVOLUTION =
   FULL_STEPS_PER_REVOLUTION * MICROSTEPS_PER_FULL_STEP;
 
-// MOTION TUNING: 180 microsteps/s is 40.5 degrees/s at 1/8 microstepping.
-// This remains faster than Python's 22 deg/s PID ceiling while using a
-// moderate acceleration that avoids the previous abrupt jumps and vibration.
-const float MAX_SPEED_MICROSTEPS_PER_SECOND = 180.0;
-const float ACCELERATION_MICROSTEPS_PER_SECOND_SQUARED = 2000.0;
+// 80 microsteps/s at 1600 microsteps/rev is 18 degrees per second.
+// These deliberately slow values are intended for direction commissioning.
+const float MAX_SPEED_MICROSTEPS_PER_SECOND = 80.0;
+const float ACCELERATION_MICROSTEPS_PER_SECOND_SQUARED = 120.0;
 const unsigned int MINIMUM_STEP_PULSE_MICROSECONDS = 2;
 
-// Pressing i assumes the gravity-resting pose is Y=+60 degrees, then moves to
-// Y=-50 degrees: a physical -110 degree move. Boot itself causes no movement.
-const float STARTUP_Y_REFERENCE_DEGREES = 60.0;
-const float STARTUP_Y_TARGET_DEGREES = -50.0;
-
-// These remain available for fixed wiring-direction corrections. Python runs
-// full PID on both axes and applies its configured Z direction sign.
+// If a positive command rotates an axis opposite to your desired positive
+// direction, change only that axis from false to true and upload again.
 const bool REVERSE_Z_DIRECTION = false;
 const bool REVERSE_Y_DIRECTION = false;
 
 
-// Serial and telemetry -----------------------------------------------------
-const unsigned long SERIAL_BAUD_RATE = 9600;
-const unsigned long POSITION_REPORT_INTERVAL_MILLISECONDS = 100;
-const unsigned long ACK_REPORT_INTERVAL_MILLISECONDS = 200;
-const byte SERIAL_BUFFER_LENGTH = 48;
+// ---------------------------------------------------------------------------
+// Safety limits
+// ---------------------------------------------------------------------------
+// All positions are relative to the software zero created at startup. Place
+// the mechanism at a safe central pose before powering/resetting the Mega.
+// Expand or tighten these limits only after measuring the available CAD
+// travel. Every z/y command is an absolute target inside these limits.
+const float Z_MINIMUM_POSITION_DEGREES = -30.0;
+const float Z_MAXIMUM_POSITION_DEGREES = 30.0;
+const float Y_MINIMUM_POSITION_DEGREES = -135.0;
+const float Y_MAXIMUM_POSITION_DEGREES = 45.0;
 
+const unsigned long SERIAL_BAUD_RATE = 9600;
+const byte SERIAL_BUFFER_LENGTH = 48;
 char serialBuffer[SERIAL_BUFFER_LENGTH];
 byte serialBufferLength = 0;
-unsigned long lastPositionReportTime = 0;
-unsigned long lastAckReportTime = 0;
-bool zWasMoving = false;
-bool yWasMoving = false;
+
+
+enum ActiveAxis {
+  NO_AXIS,
+  Z_AXIS,
+  Y_AXIS,
+  STOPPING_AXIS
+};
+
+ActiveAxis activeAxis = NO_AXIS;
 
 
 float stepsToDegrees(long steps) {
@@ -89,101 +102,113 @@ long degreesToSteps(float degrees) {
 }
 
 
-bool motorsAreStationary() {
-  return zMotor.distanceToGo() == 0 && yMotor.distanceToGo() == 0;
-}
-
-
-void printMachinePosition() {
-  // TwoAxisCameraControl.py parses this exact compact line.
-  Serial.print("POS Z=");
-  Serial.print(stepsToDegrees(zMotor.currentPosition()), 2);
-  Serial.print(" Y=");
-  Serial.println(stepsToDegrees(yMotor.currentPosition()), 2);
+void printHelp() {
+  Serial.println();
+  Serial.println("TWO-AXIS CAMERA JOG CONTROLLER");
+  Serial.println("----------------------------------------");
+  Serial.println("z10   : move Z / Motor 1 to +10 degrees");
+  Serial.println("z-10  : move Z / Motor 1 to -10 degrees");
+  Serial.println("y10   : move Y / Motor 2 to +10 degrees");
+  Serial.println("y-50  : move Y / Motor 2 to -50 degrees");
+  Serial.println("s     : smoothly stop the moving axis");
+  Serial.println("p     : print both software positions");
+  Serial.println("zero  : make the current pose software zero");
+  Serial.println("h     : print this help menu");
+  Serial.println("----------------------------------------");
+  Serial.println("Use Newline or Both NL & CR line ending.");
+  Serial.println("For the first direction test, use z1 and y1.");
+  Serial.println("Z limits: -60 to +60 deg; Y limits: -100 to +60 deg.");
+  Serial.println();
 }
 
 
 void printPositions() {
-  printMachinePosition();
-
   Serial.print("Z / Motor 1: ");
   Serial.print(stepsToDegrees(zMotor.currentPosition()), 2);
-  Serial.print(" deg, target ");
-  Serial.print(stepsToDegrees(zMotor.targetPosition()), 2);
-  Serial.println(" deg");
+  Serial.print(" deg  (");
+  Serial.print(zMotor.currentPosition());
+  Serial.println(" microsteps)");
 
   Serial.print("Y / Motor 2: ");
   Serial.print(stepsToDegrees(yMotor.currentPosition()), 2);
-  Serial.print(" deg, target ");
-  Serial.print(stepsToDegrees(yMotor.targetPosition()), 2);
-  Serial.println(" deg");
+  Serial.print(" deg  (");
+  Serial.print(yMotor.currentPosition());
+  Serial.println(" microsteps)");
 }
 
 
-void printHelp() {
-  Serial.println();
-  Serial.println("TWO-AXIS CAMERA FOLLOW CONTROLLER");
-  Serial.println("----------------------------------------");
-  Serial.println("z10   : set absolute Z target to +10 deg");
-  Serial.println("z-10  : set absolute Z target to -10 deg");
-  Serial.println("y10   : set absolute Y target to +10 deg");
-  Serial.println("y-50  : set absolute Y target to -50 deg");
-  Serial.println("s     : stop both axes");
-  Serial.println("p     : print positions and targets");
-  Serial.println("i     : initialize gravity-rest Y=+60, move to -50");
-  Serial.println("zero  : make the stationary pose software zero");
-  Serial.println("h     : print this help menu");
-  Serial.println("----------------------------------------");
-  Serial.println("Angular software limits: NONE");
-  Serial.println("Use Newline or Both NL & CR line ending.");
-  Serial.println();
+bool motorsAreStationary() {
+  return activeAxis == NO_AXIS
+    && zMotor.distanceToGo() == 0
+    && yMotor.distanceToGo() == 0;
 }
 
 
-void setAxisTarget(char axis, float targetDegrees) {
-  AccelStepper *motor = axis == 'z' ? &zMotor : &yMotor;
-  long targetSteps = degreesToSteps(targetDegrees);
-
-  motor->moveTo(targetSteps);
-  if (axis == 'z') {
-    zWasMoving = zMotor.distanceToGo() != 0;
-  } else {
-    yWasMoving = yMotor.distanceToGo() != 0;
-  }
-
-  // At a 20 Hz two-axis update rate, acknowledging every command would nearly
-  // fill a 9600-baud output channel. Position telemetry remains at 10 Hz and
-  // this throttled ACK proves that commands continue to arrive.
-  unsigned long currentTime = millis();
-  if (currentTime - lastAckReportTime >= ACK_REPORT_INTERVAL_MILLISECONDS) {
-    lastAckReportTime = currentTime;
-    Serial.print("ACK ");
-    Serial.print(axis == 'z' ? "Z_TARGET=" : "Y_TARGET=");
-    Serial.println(stepsToDegrees(targetSteps), 2);
-  }
-}
-
-
-void initializeYFromGravityRest() {
+void startMoveToPosition(char axis, float targetDegrees) {
   if (!motorsAreStationary()) {
-    Serial.println("REJECTED: stop both axes before Y initialization.");
+    Serial.println("REJECTED: an axis is moving. Wait or send s.");
     return;
   }
 
-  yMotor.setCurrentPosition(degreesToSteps(STARTUP_Y_REFERENCE_DEGREES));
-  yMotor.moveTo(degreesToSteps(STARTUP_Y_TARGET_DEGREES));
-  yWasMoving = yMotor.distanceToGo() != 0;
-  Serial.println("INITIALIZING Y: assumed +60 deg, target -50 deg.");
-  printMachinePosition();
+  AccelStepper *motor = axis == 'z' ? &zMotor : &yMotor;
+  float currentDegrees = stepsToDegrees(motor->currentPosition());
+  float minimumDegrees = axis == 'z'
+    ? Z_MINIMUM_POSITION_DEGREES
+    : Y_MINIMUM_POSITION_DEGREES;
+  float maximumDegrees = axis == 'z'
+    ? Z_MAXIMUM_POSITION_DEGREES
+    : Y_MAXIMUM_POSITION_DEGREES;
+
+  if (targetDegrees < minimumDegrees || targetDegrees > maximumDegrees) {
+    Serial.print("REJECTED: ");
+    Serial.print(axis == 'z' ? "Z" : "Y");
+    Serial.print(" target ");
+    Serial.print(targetDegrees, 2);
+    Serial.print(" deg is outside [");
+    Serial.print(minimumDegrees, 1);
+    Serial.print(", ");
+    Serial.print(maximumDegrees, 1);
+    Serial.println("] deg.");
+    return;
+  }
+
+  long targetSteps = degreesToSteps(targetDegrees);
+  if (targetSteps == motor->currentPosition()) {
+    Serial.print(axis == 'z' ? "Z" : "Y");
+    Serial.print(" is already at approximately ");
+    Serial.print(currentDegrees, 2);
+    Serial.println(" degrees.");
+    return;
+  }
+
+  motor->moveTo(targetSteps);
+  activeAxis = axis == 'z' ? Z_AXIS : Y_AXIS;
+
+  Serial.print("MOVING ");
+  Serial.print(axis == 'z' ? "Z / Motor 1" : "Y / Motor 2");
+  Serial.print(" from ");
+  Serial.print(currentDegrees, 2);
+  Serial.print(" deg to absolute software position ");
+  Serial.print(targetDegrees, 2);
+  Serial.print(" deg at ");
+  Serial.print(
+    360.0 * MAX_SPEED_MICROSTEPS_PER_SECOND / STEPS_PER_REVOLUTION,
+    1
+  );
+  Serial.println(" deg/s maximum.");
 }
 
 
 void stopMotion() {
+  if (motorsAreStationary()) {
+    Serial.println("Both axes are already stopped.");
+    return;
+  }
+
   zMotor.stop();
   yMotor.stop();
-  zWasMoving = zMotor.distanceToGo() != 0;
-  yWasMoving = yMotor.distanceToGo() != 0;
-  Serial.println("STOP REQUESTED");
+  activeAxis = STOPPING_AXIS;
+  Serial.println("STOP REQUESTED: decelerating the active axis.");
 }
 
 
@@ -217,11 +242,6 @@ void processSerialLine(char *line) {
     return;
   }
 
-  if (strcasecmp(command, "i") == 0) {
-    initializeYFromGravityRest();
-    return;
-  }
-
   if (strcasecmp(command, "h") == 0) {
     printHelp();
     return;
@@ -234,18 +254,13 @@ void processSerialLine(char *line) {
     }
     zMotor.setCurrentPosition(0);
     yMotor.setCurrentPosition(0);
-    zMotor.moveTo(0);
-    yMotor.moveTo(0);
-    zWasMoving = false;
-    yWasMoving = false;
     Serial.println("Current pose is now software Z=0, Y=0.");
-    printMachinePosition();
     return;
   }
 
   char axis = tolower(command[0]);
   if (axis != 'z' && axis != 'y') {
-    Serial.println("INVALID: use z<number>, y<number>, i, s, p, zero, or h.");
+    Serial.println("INVALID: use z<number>, y<number>, s, p, zero, or h.");
     return;
   }
 
@@ -264,7 +279,7 @@ void processSerialLine(char *line) {
     return;
   }
 
-  setAxisTarget(axis, targetDegrees);
+  startMoveToPosition(axis, targetDegrees);
 }
 
 
@@ -291,85 +306,60 @@ void readSerialWithoutBlocking() {
 }
 
 
-void updateMotionState() {
-  bool zMoving = zMotor.distanceToGo() != 0;
-  bool yMoving = yMotor.distanceToGo() != 0;
-  bool anAxisFinished = false;
-
-  if (zWasMoving && !zMoving) {
-    Serial.println("DONE Z");
-    anAxisFinished = true;
-  }
-  if (yWasMoving && !yMoving) {
-    Serial.println("DONE Y");
-    anAxisFinished = true;
-  }
-
-  // Short corrections can finish before the periodic report interval. Always
-  // publish the final position so Python never builds a target from stale data.
-  if (anAxisFinished) {
-    printMachinePosition();
-  }
-
-  zWasMoving = zMoving;
-  yWasMoving = yMoving;
-
-  unsigned long currentTime = millis();
-  if (
-    (zMoving || yMoving)
-    && currentTime - lastPositionReportTime
-      >= POSITION_REPORT_INTERVAL_MILLISECONDS
+void updateCompletedMotion() {
+  if (activeAxis == Z_AXIS && zMotor.distanceToGo() == 0) {
+    Serial.println("Z / Motor 1 movement complete.");
+    activeAxis = NO_AXIS;
+    printPositions();
+  } else if (activeAxis == Y_AXIS && yMotor.distanceToGo() == 0) {
+    Serial.println("Y / Motor 2 movement complete.");
+    activeAxis = NO_AXIS;
+    printPositions();
+  } else if (
+    activeAxis == STOPPING_AXIS
+    && zMotor.distanceToGo() == 0
+    && yMotor.distanceToGo() == 0
   ) {
-    lastPositionReportTime = currentTime;
-    printMachinePosition();
+    Serial.println("Both axes stopped.");
+    activeAxis = NO_AXIS;
+    printPositions();
   }
 }
 
 
-void configureMotor(
-  AccelStepper &motor,
-  bool reverseDirection,
-  long assumedStartingPositionSteps
-) {
+void configureMotor(AccelStepper &motor, bool reverseDirection) {
   motor.setMaxSpeed(MAX_SPEED_MICROSTEPS_PER_SECOND);
   motor.setAcceleration(ACCELERATION_MICROSTEPS_PER_SECOND_SQUARED);
   motor.setMinPulseWidth(MINIMUM_STEP_PULSE_MICROSECONDS);
   motor.setPinsInverted(reverseDirection, false, false);
 
-  // This is an unverified software reference, not physical homing.
-  motor.setCurrentPosition(assumedStartingPositionSteps);
-  motor.moveTo(assumedStartingPositionSteps);
+  // This is only a software reference; there are no homing sensors yet.
+  motor.setCurrentPosition(0);
+  motor.moveTo(0);
 }
 
 
 void setup() {
   Serial.begin(SERIAL_BAUD_RATE);
-  configureMotor(zMotor, REVERSE_Z_DIRECTION, 0);
-  configureMotor(yMotor, REVERSE_Y_DIRECTION, 0);
+
+  configureMotor(zMotor, REVERSE_Z_DIRECTION);
+  configureMotor(yMotor, REVERSE_Y_DIRECTION);
 
   Serial.println();
-  Serial.println("TWO-AXIS CAMERA FOLLOW CONTROLLER READY");
+  Serial.println("TWO-AXIS CAMERA JOG CONTROLLER READY");
   Serial.print("Resolution: ");
   Serial.print(STEPS_PER_REVOLUTION);
-  Serial.println(" microsteps/revolution");
-  Serial.print("Maximum speed: ");
-  Serial.print(
-    360.0 * MAX_SPEED_MICROSTEPS_PER_SECOND / STEPS_PER_REVOLUTION,
-    1
-  );
-  Serial.println(" deg/s");
-  Serial.println("Angular software limits: NONE");
-  Serial.println("Boot causes no motion. Press i to initialize Y +60 -> -50.");
-  Serial.println("CAUTION: no homing, limit switches, or encoders are present.");
+  Serial.println(" microsteps/revolution (1/8 mode)");
+  Serial.println("Startup pose is assumed to be software Z=0, Y=0.");
+  Serial.println("CAUTION: no limit switches or physical homing are present.");
   printHelp();
 }
 
 
 void loop() {
-  // Both motors are serviced every pass, so they can move simultaneously.
+  // run() is non-blocking and must be called as frequently as possible.
   zMotor.run();
   yMotor.run();
-
-  updateMotionState();
+  updateCompletedMotion();
   readSerialWithoutBlocking();
 }
