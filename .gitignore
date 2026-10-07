@@ -1,5 +1,9 @@
 # Local Python environment (recreated from requirements.txt)
 .venv/
+.balance-venv/
+.balance-build/
+balance_logs/
+balance_settings.json
 
 # Python-generated cache files
 __pycache__/

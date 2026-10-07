@@ -106,6 +106,18 @@ tested controllers with speed limits, safety checks, and recovery behavior.
 
 ## Current prototype
 
+### Two-wheel IMU balancing prototype
+
+`BalanceRobot.py` provides a D435if IMU-only controller and tuning dashboard for
+the Mega/A4988 two-wheel base. `BalanceMega/BalanceMega.ino` generates both wheel
+pulse trains on the existing pins, with a command timeout. Setup, calibration,
+wheel direction tests, tuning and limitations are in [BALANCING.md](BALANCING.md).
+The program starts disarmed; `--demo` and `--imu-only` allow checks without motor
+output. Install its separate dependencies from `balance-requirements.txt`.
+For a preliminary test on a stand, upload `WheelTestMega/WheelTestMega.ino` and
+use Serial Monitor to request small wheel rotations, test directions, or stop.
+This test sketch runs independently of the camera and Python controller.
+
 The current repository contains a lightweight MediaPipe hand-tracking program.
 It opens a camera feed, mirrors the image, tracks 21 hand landmarks, marks the
 wrist, fingertips, and palm center, reports handedness, and recognizes an open
