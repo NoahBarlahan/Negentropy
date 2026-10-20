@@ -1,0 +1,25 @@
+# Local Python environment (recreated from requirements.txt)
+.venv/
+.balance-venv/
+.balance-build/
+balance_logs/
+balance_settings.json
+
+# Python-generated cache files
+__pycache__/
+*.py[cod]
+
+# Runtime hand-tracking datasets (may contain personal activity data)
+hand_tracking_data/
+hand_tracking_visuals/
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Previous experiments and local backup copies
+FastSAM-s.pt
+InitialCameraDebug.*backup*
+.history/

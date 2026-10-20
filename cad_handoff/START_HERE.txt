@@ -1,0 +1,46 @@
+NEGENTROPY - SIMPLE SOLIDWORKS CAD DIMENSIONS
+Revision: bc4b3e61747a
+Finalized: 2026-10-20 19:09 UTC
+Contact model: Rounded nub
+Symmetry: True (right lengths/radii use effective mirrored values)
+
+START YOUR CAD
+1. Keep negentropy_equations.txt in a permanent folder beside your CAD project.
+2. Open the .txt in Notepad to inspect or edit dimensions. Preserve quotes and mm.
+3. In SolidWorks open Tools > Equations > Import and select this text file.
+   Enable Link to File if available to update CAD from later file edits.
+4. Set the hip-to-knee sketch distance to ="ThighLength_L" and the knee-to-shin-
+   endpoint distance to ="ShinLength_L". Use _R for the other leg.
+5. Use ="FootRadius_L" for a rounded nub radius, or =2*"FootRadius_L" for diameter.
+   Use WaistLength, WaistWidth and WaistHeight for your waist platform/body.
+6. When supplied, ThighWidth/ThighThickness and ShinWidth/ShinThickness drive
+   the printed link cross-sections. These four values are shared by both legs.
+7. Link/import in each part that needs the variables, then rebuild your CAD.
+
+UPDATING
+Finalize again and replace the SAME linked negentropy_equations.txt, then rebuild.
+Use a stable path and retain revision ZIPs separately. Without linking, re-import.
+Dashboard edits do not change a frozen export until you finalize again.
+Editing the text does not send values back to the dashboard.
+
+DIMENSION REFERENCES
+Thigh/shin lengths are joint-reference distances, not outside printed lengths.
+The shin endpoint equals the sphere center only with zero foot attachment offset.
+Dashboard foot offsets (L x/z, R x/z), in mm:
+0.0, 0.0; 0.0, 0.0.
+These offsets are notes only, not exported equations.
+
+Waist dimensions default to the dashboard platform envelope. WaistHeight is
+platform thickness unless you supply a CAD body-height override. CAD-only width,
+thickness and waist overrides do not alter robot geometry, masses or calculated
+height in the dashboard; they are not structurally optimized. Update the model
+and mass estimates separately as your CAD develops. Unspecified cross-sections
+are omitted, rather than assigned guessed values.
+No pose angles, case positions, servo envelopes, overall-height targets or
+redundant foot diameters are exported. See parameter_map.csv for definitions.
+biped_config.json restores the dashboard model. cad_dimensions.json records CAD
+extras in mm; re-enter these in the CAD tab when restoring another session.
+
+Measure mounts, shaft/horn geometry, bearings, fasteners and print fits yourself.
+These variables do not generate sketches/features/mates or verify robot strength.
+Official import/link instructions: https://help.solidworks.com/2023/english/SolidWorks/sldworks/t_EQN_Importing_Equations.htm

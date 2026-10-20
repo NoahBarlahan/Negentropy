@@ -1,0 +1,5 @@
+numpy>=2.0,<3
+scipy>=1.14,<2
+streamlit>=1.66,<2
+plotly>=6,<8
+pytest>=8,<10

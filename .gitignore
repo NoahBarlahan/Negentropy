@@ -23,3 +23,8 @@ Thumbs.db
 FastSAM-s.pt
 InitialCameraDebug.*backup*
 .history/
+
+# Biped dashboard environment and generated test output
+.dashboard-venv/
+.pytest_cache/
+test-results.xml

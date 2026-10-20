@@ -1,5 +1,20 @@
 # Personal VLA Cinematography and Sports-Coaching Robot
 
+## Biped design dashboard
+
+The dashboard lives in this main project folder. Double-click `run_dashboard.bat`,
+or run this command from a PowerShell terminal in Negentropy:
+
+```powershell
+.\.dashboard-venv\Scripts\python.exe -m streamlit run app.py --server.port 8502
+```
+
+Open http://127.0.0.1:8502/. See [BIPED_DASHBOARD.md](BIPED_DASHBOARD.md) for
+setup, design goals, walking preview, and SolidWorks parameter exports.
+Dashboard dependencies are in `dashboard-requirements.txt`, tests in
+`dashboard_tests`, and CAD exports in `cad_handoff`.
+
+
 ## Project goal
 
 The goal of this project is to build a personal robot that can understand
@@ -312,3 +327,4 @@ and return understandable feedback.
 
 The overall objective is a modular intelligent robot that acts as a personal
 cameraperson, activity tracker, and sports-performance coach.
+
