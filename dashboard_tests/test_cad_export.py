@@ -3,7 +3,7 @@ import re
 import zipfile
 import pytest
 from config import defaults, loads
-from cad_export import parameters, equations, finalize, bundle, EQUATIONS_FILE
+from cad_export import parameters, equations, finalize, bundle, with_units, EQUATIONS_FILE
 
 
 def test_importer_text_has_unique_quoted_variables_explicit_units_and_references():
@@ -76,3 +76,21 @@ def test_optional_cad_cross_sections_are_explicit_and_do_not_alter_model():
         assert json.loads(archive.read('cad_dimensions.json'))==snapshot['dimensions']
     for invalid in ({'ThighWidth':0},{'Unknown':4},{'ShinThickness':float('inf')}):
         with pytest.raises(ValueError): finalize(c,invalid)
+
+
+def test_unit_conversion_preserves_frozen_geometry_and_package_units():
+    snapshot=finalize(defaults(),{'ThighWidth':25.4})
+    inches=with_units(snapshot,'in')
+    assert '"ThighLength_L" = 2.55905512 in' in inches['text']
+    assert '"ThighWidth" = 1 in' in inches['text']
+    assert inches['config']==snapshot['config']
+    assert inches['dimensions']==snapshot['dimensions']
+    assert inches['created']==snapshot['created']
+    assert inches['revision']!=snapshot['revision']
+    assert snapshot['unit']=='mm'
+    assert with_units(inches,'mm')['text']==snapshot['text']
+    with zipfile.ZipFile(io.BytesIO(bundle(inches))) as archive:
+        assert archive.read(EQUATIONS_FILE).decode()==inches['text']
+        assert ',in,' in archive.read('parameter_map.csv').decode()
+        assert loads(archive.read('biped_config.json').decode())['L_thigh']==65
+    with pytest.raises(ValueError): equations(defaults(),unit='cm')

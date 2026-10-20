@@ -30,12 +30,15 @@ def clean_dimensions(dimensions=None):
     return result
 
 
-def parameters(data,dimensions=None):
+def parameters(data,dimensions=None,unit='mm'):
+    if unit not in ('mm','in'):
+        raise ValueError('CAD export length units must be mm or in.')
     c=effective(data);dimensions=clean_dimensions(dimensions)
     rows=[]
     def add(name,value,meaning):
-        rows.append(dict(variable=name,value=float(value),unit='mm',meaning=meaning,
-                         equation=f'{float(value):.8f}'.rstrip('0').rstrip('.')+' mm'))
+        shown=float(value)/(25.4 if unit=='in' else 1.)
+        rows.append(dict(variable=name,value=shown,unit=unit,meaning=meaning,
+                         equation=f'{shown:.8f}'.rstrip('0').rstrip('.')+' '+unit))
     add('HipSpacing',c['spacing'],'Distance between hip pitch axes')
     for name,key in (('WaistLength','platform_l'),('WaistWidth','platform_w'),('WaistHeight','platform_t')):
         add(name,dimensions.get(name,c[key]),'CAD waist dimension; defaults to the dashboard platform envelope')
@@ -53,17 +56,24 @@ def parameters(data,dimensions=None):
     return rows
 
 
-def equations(data,dimensions=None):
-    return ''.join(f'"{r["variable"]}" = {r["equation"]}\r\n' for r in parameters(data,dimensions))
+def equations(data,dimensions=None,unit='mm'):
+    return ''.join(f'"{r["variable"]}" = {r["equation"]}\r\n' for r in parameters(data,dimensions,unit))
 
 
-def finalize(data,dimensions=None):
+def finalize(data,dimensions=None,unit='mm'):
     config=deepcopy(validate(data));dimensions=clean_dimensions(dimensions)
-    text=equations(config,dimensions)
-    signature=hashlib.sha256((dumps(config)+json.dumps(dimensions,sort_keys=True)+str(EXPORT_SCHEMA)).encode('utf-8')).hexdigest()[:12]
-    return {'config':config,'dimensions':dimensions,'export_schema':EXPORT_SCHEMA,'revision':signature,
+    text=equations(config,dimensions,unit)
+    signature=hashlib.sha256((dumps(config)+json.dumps(dimensions,sort_keys=True)+str(EXPORT_SCHEMA)+unit).encode('utf-8')).hexdigest()[:12]
+    return {'config':config,'dimensions':dimensions,'unit':unit,'export_schema':EXPORT_SCHEMA,'revision':signature,
             'created':datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
-            'parameters':parameters(config,dimensions),'text':text}
+            'parameters':parameters(config,dimensions,unit),'text':text}
+
+
+def with_units(snapshot,unit):
+    """Reformat only the frozen design, never the current/live configuration."""
+    converted=finalize(snapshot['config'],snapshot['dimensions'],unit)
+    converted['created']=snapshot['created']
+    return converted
 
 
 def instructions(snapshot):
@@ -72,11 +82,12 @@ def instructions(snapshot):
 Revision: {snapshot['revision']}
 Finalized: {snapshot['created']}
 Contact model: {c['foot_model']}
+Equations and parameter-map units: {snapshot.get('unit','mm')}
 Symmetry: {c['symmetry']} (right lengths/radii use effective mirrored values)
 
 START YOUR CAD
 1. Keep {EQUATIONS_FILE} in a permanent folder beside your CAD project.
-2. Open the .txt in Notepad to inspect or edit dimensions. Preserve quotes and mm.
+2. Open the .txt in Notepad to inspect or edit dimensions. Preserve quotes and unit suffixes.
 3. In SolidWorks open Tools > Equations > Import and select this text file.
    Enable Link to File if available to update CAD from later file edits.
 4. Set the hip-to-knee sketch distance to ="ThighLength_L" and the knee-to-shin-
@@ -91,6 +102,7 @@ UPDATING
 Finalize again and replace the SAME linked {EQUATIONS_FILE}, then rebuild.
 Use a stable path and retain revision ZIPs separately. Without linking, re-import.
 Dashboard edits do not change a frozen export until you finalize again.
+Switching dashboard length units reformats this same frozen design for download.
 Editing the text does not send values back to the dashboard.
 
 DIMENSION REFERENCES

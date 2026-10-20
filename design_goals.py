@@ -8,7 +8,7 @@ from sweep import compare, design_criteria
 from gait import preview
 
 
-def optimize(data, height, payload, step, clearance, mass_limit):
+def optimize(data, height, payload, step, clearance, mass_limit, *, period=1.6, duty=.6, preserve_payload_target=False):
     """Return a reviewable result without mutating data, including on failure.
 
     Lengths solve envelope height, not hip height. Fixed hardware and measured
@@ -27,6 +27,8 @@ def optimize(data, height, payload, step, clearance, mass_limit):
                 payload_mass=float(payload),payload_target=float(payload),
                 min_height=max(1.,height-1.),max_height=height+1.,
                 reach=float(step),lift=float(clearance),max_mass=float(mass_limit))
+    if preserve_payload_target:
+        base['payload_target']=data['payload_target']
     candidates=[]; failures={}; tested=0
     def reject(reason):
         failures[reason]=failures.get(reason,0)+1
@@ -61,7 +63,7 @@ def optimize(data, height, payload, step, clearance, mass_limit):
             if failed:
                 for key in failed: reject(key)
                 continue
-            motion=preview(c,cycles=1,samples=16)
+            motion=preview(c,cycles=1,samples=16,period=period,duty=duty)
             if not motion['complete']:
                 reject('Sampled walking reach / clearance');continue
             peak=row['objective worst screening (N·m)']
@@ -80,4 +82,57 @@ def optimize(data, height, payload, step, clearance, mass_limit):
     candidates.sort(key=lambda item:(item['peak'],abs(item['ratio']-.5),item['bend']))
     return {'source':deepcopy(data),'applied':candidates[0]['config'] if candidates else None,
             'chosen':candidates[0] if candidates else None,'tested':tested,'passing':len(candidates),
-            'failures':failures,'goals':dict(zip(('height','payload','step','clearance','mass_limit'),values))}
+            'failures':failures,'shortlist':candidates[:5],
+            'goals':dict(zip(('height','payload','step','clearance','mass_limit'),values))}
+
+
+def optimize_walking(data,height):
+    """Height-only, positive-progress stepping search, with no speed reward.
+
+    Preserve actual payload, hardware and weight budget. Small strides and
+    clearances are assumptions for level ground, not terrain measurements.
+    The full two-cycle path is mandatory before applying any candidate.
+    """
+    c=validate(data)
+    if not np.isfinite(height) or not 80<=height<=450:
+        raise ValueError('Height must be between 80 and 450 mm.')
+    tested=passing=0;failures={};valid=[]
+    for step_share,lift_share in ((.03,.025),(.05,.035),(.08,.045)):
+        step=float(np.clip(height*step_share,3.,20.))
+        lift=float(np.clip(height*lift_share,3.,10.))
+        report=optimize(c,height,c['payload_mass'],step,lift,c['max_mass'],period=4.,duty=.7,preserve_payload_target=True)
+        tested+=report['tested'];passing+=report['passing']
+        for key,value in report['failures'].items(): failures[key]=failures.get(key,0)+value
+        for candidate in report['shortlist']:
+            design=candidate['config'];period=4.
+            motion=preview(design,period=period,duty=.7,cycles=2,samples=40)
+            if not motion['complete']:
+                failures['Full walking path']=failures.get('Full walking path',0)+1;continue
+            # Keep a finite knee-bend margin instead of selecting nearly straight legs.
+            knees=[abs(frame['angles_deg'][i]) for frame in motion['frames'] for i in (1,3)]
+            margin=min(min(q,abs(180-q)) for q in knees)
+            if margin<10.:
+                failures['Knee bend below 10 degrees']=failures.get('Knee bend below 10 degrees',0)+1;continue
+            period=max(4.,4.*motion['max_joint_speed_deg_s']/45.)
+            if period>10.:
+                failures['Assumed joint speed limit']=failures.get('Assumed joint speed limit',0)+1;continue
+            if period>4.: motion=preview(design,period=period,duty=.7,cycles=2,samples=40)
+            peak=0.
+            for frame in motion['frames']:
+                robot=frame['robot']
+                for load in torque_rows(robot):
+                    side,joint=load['joint'].split();leg=robot['legs'][side]
+                    reaction=(robot['mass']*G*abs(leg['sole'][0,0]-leg[joint][0])
+                              if frame['phases'][side].startswith('stance') else 0.)
+                    peak=max(peak,(abs(load['gravity moment (N·m)'])+reaction)*design['multiplier'])
+            if not motion['complete'] or peak>design['stall']*design['derating']:
+                failures['Full path torque screening']=failures.get('Full path torque screening',0)+1;continue
+            valid.append({**candidate,'peak':peak,'period':period,'duty':.7,
+                          'knee_margin':margin,'motion':motion})
+            break
+    valid.sort(key=lambda item:(item['peak'],-item['knee_margin']))
+    chosen=valid[0] if valid else None
+    return {'source':deepcopy(data),'applied':deepcopy(chosen['config']) if chosen else None,
+            'chosen':chosen,'tested':tested,'passing':passing,'validated_profiles':len(valid),
+            'failures':failures,'walking_priority':True,
+            'goals':{'height':height},'motion':chosen['motion'] if chosen else None}

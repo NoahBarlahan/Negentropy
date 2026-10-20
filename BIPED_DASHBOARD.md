@@ -80,40 +80,38 @@ Additional endpoints are evaluated separately per limb with the pelvis externall
 
 The objective is the worst multiplied torque across the candidate stance and those swing samples. Only candidates passing all selected criteria and having an evaluated objective receive a rank. You may deselect criteria, in which case the status explicitly applies only to the selected checks; all individual results remain visible. A finite grid cannot prove global optimality. The approximate packaging thresholds prevent trivially short links from winning without a warning, but cannot establish CAD fit.
 
-## Simple design goals
+## Height-only walking design
 
-Start at the top of the dashboard: enter overall robot height, payload mass,
-step length and foot clearance, then press **Optimize my design**. An optional
-weight budget is collapsed below the four main controls. Length inputs follow
-the mm/in selector. Detailed geometry, mass locations and servo assumptions are
-in **Advanced inputs**; legacy placement/contact/search controls are collapsed
-in the sidebar's **Advanced settings**.
+The only main input is total robot height. Press **Optimize for walking** to
+choose leg proportions, lengths, hip/knee pose, step length, lift and slow timing.
+Actual payload, mass estimates, weight budget, joint limits, foot attachments and
+hardware assumptions remain in Advanced inputs. They are preserved as constraints.
 
-The new goal search tries 18 combinations: thigh shares of 45%, 50%, 55% and
-knee bends of 25, 35, 45, 55, 65, 75 degrees. It solves total link length by
-bisection against the full rendered envelope height, grounds the rounded feet,
-and chooses the hip angle to place the two-link endpoint under the hip before
-attachment offsets. It adds the requested payload to both the actual mass model
-and the payload requirement. Knee-servo z follows thigh length and printed-link
-CoM z is estimated at half-link length; component masses and remaining offsets
-stay fixed. Body layout, spherical radius and hardware ratings remain constraints.
+Three positive-progress motion profiles use step lengths of 3%, 5%, 8% of height
+(clipped to 3–20 mm), paired with lifts of 2.5%, 3.5%, 4.5% (clipped to 3–10 mm).
+For each, 18 link-ratio/knee-bend geometries solve the requested envelope height.
+The best five screened candidates per profile are shortlisted, and the first to
+pass full two-cycle, 81-pose validation becomes that profile's candidate. The
+final ranking favors lower full-path gravity/vertical-weight screening torque,
+then more knee-bend margin. There is no reward for speed or zero-length steps.
 
-Candidates must pass the existing geometry, packaging, mass, endpoint reach and
-suspended-gravity checks plus a full one-cycle kinematic preview at 17 time
-samples. At each sampled pose the torque screen uses the absolute distal gravity
-moment plus a full-robot-weight vertical reaction moment on each stance leg,
-multiplied by the configured screening factor. This deliberately conservative
-load case is not a solved ground reaction or dynamic equilibrium. The passing
-candidate with the smallest peak screening demand is selected; ties favor equal
-links, then less knee bend. This is a bounded search, not a global optimum.
+Knees must stay at least 10 degrees from straight/folded singular configurations.
+Timing begins at 4 s/cycle and 70% stance, slowing to limit sampled joint speeds
+to an assumed 45 degrees/s (maximum supported cycle 10 s). These are planning
+assumptions, not measured servo ratings. Full-path load screening uses the
+absolute distal gravity moment plus full robot-weight reaction moment per stance
+leg, multiplied by the existing factor. It is not a dynamic ground-force solution.
 
-The applied result includes a 1 mm height tolerance, symmetric pose, derived
-lengths/hip height, payload, goals and estimated link mass locations. It can be
-undone until edited. No passing candidate leaves the entire previous model
-unchanged and reports failing constraints. Configuration JSON remains version 2;
-goal results are saved as ordinary model parameters. Explanations and search
-history are session-only. Dynamic balance, servo thermal capability, friction,
-acceleration and structural sizing still need validation; animation is kinematic.
+The chosen animation is ready automatically in Walking preview. Timing controls
+are under Advanced timing overrides. Failed searches preserve the current model;
+undo restores the pre-search configuration. Masses stay fixed; knee-servo and
+printed-link center locations follow the generated leg lengths.
+
+These checks establish a sampled kinematic/load-screening candidate, not actual
+walking. Slower motion does not establish balance. Four pitch servos and rounded
+contacts still need dynamic/lateral control, friction and thermal evaluation,
+structural checks and physical experiments. No controller or motor command is
+created by the dashboard.
 
 ## SolidWorks / Notepad parameter export
 
@@ -131,7 +129,7 @@ dimensions do not alter the mechanics model, masses or optimized geometry, and
 are not structural sizing recommendations. Link lengths remain joint-reference
 distances; with zero foot offset, ShinLength ends at the sphere center.
 
-Equations always use explicit mm. Use `="ThighLength_L"` on your thigh sketch,
+Equations and the parameter map follow the sidebar Length units selector, with explicit mm or in suffixes. Switching units reformats the frozen export immediately without changing its physical dimensions; configuration and CAD-dimensions restore JSON stay in mm. Use `="ThighLength_L"` on your thigh sketch,
 `="ThighWidth"` on its width when supplied, and `="FootRadius_L"` on a nub radius.
 Use `=2*"FootRadius_L"` for a diameter. Existing CAD references to removed export
 variables must be updated to this smaller parameter set.
@@ -153,4 +151,6 @@ Reference: [SOLIDWORKS import/link instructions](https://help.solidworks.com/202
 
 
 You can also double-click `run_dashboard.bat` from the project root. It uses the dashboard's dedicated interpreter and runs the root `app.py` on port 8502. Use `python -m pip` and `python -m streamlit` through that interpreter; no environment activation is needed.
+
+
 

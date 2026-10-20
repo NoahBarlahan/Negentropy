@@ -14,8 +14,8 @@ from sweep import compare, CRITERIA, design_criteria
 from gait import preview, animation
 from units import mm_per_unit, length_label, format_length, length_rows, length_figure
 from suggestions import suggest, undo, PRIORITIES, CHANGED_KEYS
-from design_goals import optimize
-from cad_export import finalize, bundle, EQUATIONS_FILE, HELP_URL, CAD_FIELDS, EXPORT_SCHEMA
+from design_goals import optimize_walking
+from cad_export import finalize, bundle, with_units, EQUATIONS_FILE, HELP_URL, CAD_FIELDS, EXPORT_SCHEMA
 
 st.set_page_config(page_title="Biped Studio · MG996R", page_icon="🤖", layout="wide")
 st.markdown("""<style>
@@ -178,13 +178,17 @@ def undo_guess():
 def optimize_goals():
     try:
         scale=mm_per_unit(st.session_state.length_unit)
-        report=optimize(st.session_state.cfg,
-            st.session_state.goal_height*scale,st.session_state.goal_payload,
-            st.session_state.goal_step*scale,st.session_state.goal_clearance*scale,
-            st.session_state.goal_mass_limit)
+        report=optimize_walking(st.session_state.cfg,st.session_state.goal_height*scale)
         if report['applied'] is not None:
             seed(dict(report['applied']))
-            st.session_state.pop('motion_result',None)
+            chosen=report['chosen']
+            for kind in ('s','n'):
+                st.session_state['motion_period__'+kind]=chosen['period']
+                st.session_state['motion_duty__'+kind]=chosen['duty']
+            st.session_state.motion_cycles=2
+            st.session_state.motion_result=report['motion']
+            st.session_state.motion_source=(dumps(st.session_state.cfg),chosen['period'],chosen['duty'],2)
+            st.session_state.pop('motion_error',None)
         st.session_state.goal_report=report
         st.session_state.pop('goal_error',None)
     except ValueError as exc:
@@ -208,7 +212,7 @@ def cad_dimension_values():
 
 def finalize_cad():
     try:
-        st.session_state.cad_snapshot=finalize(st.session_state.cfg,cad_dimension_values())
+        st.session_state.cad_snapshot=finalize(st.session_state.cfg,cad_dimension_values(),st.session_state.length_unit)
         st.session_state.pop('cad_error',None)
     except ValueError as exc:
         st.session_state.cad_error=str(exc)
@@ -252,48 +256,41 @@ with st.sidebar:
             st.caption(f"Correct the inputs before saving: {exc}")
 
 st.caption("BIPED STUDIO / 4 × MG996R")
-st.title("What should your robot do?")
-st.write("Set your goals. Let the dashboard choose the leg lengths and starting pose.")
+st.title("How tall should your robot be?")
+st.write("Enter total height. The dashboard chooses the legs and a gentle stepping motion; speed is not a design target.")
 unit=st.session_state.length_unit
 scale=mm_per_unit(unit)
 with st.form('design_goals'):
-    a,b=st.columns(2)
-    with a:
-        st.number_input(f"Robot height ({unit})",min_value=80./scale,max_value=450./scale,
-                        step=1./scale,key='goal_height',help='Ground to the top of the modeled robot, excluding the payload envelope.')
-        st.number_input('Payload to carry (g)',min_value=0.,max_value=2000.,step=10.,key='goal_payload')
-    with b:
-        st.number_input(f"Step length ({unit})",min_value=0.,max_value=160./scale,
-                        step=1./scale,key='goal_step',help='Forward travel per alternating footfall; a full gait cycle travels twice this distance.')
-        st.number_input(f"Foot clearance ({unit})",min_value=0.,max_value=120./scale,
-                        step=1./scale,key='goal_clearance')
-    with st.expander('Weight budget'):
-        st.number_input('Maximum total mass including payload (g)',min_value=10.,max_value=5000.,step=10.,key='goal_mass_limit')
-    st.form_submit_button('Optimize my design',on_click=optimize_goals,type='primary',width='stretch')
-st.caption('Automatically chooses symmetric thigh/shin lengths, hip/knee angles and grounded hip height. Hardware, body layout and component masses use the assumptions in Advanced inputs.')
+    st.number_input(f"Total robot height ({unit})",min_value=80./scale,max_value=450./scale,
+                    step=1./scale,key='goal_height',help='Ground to the top of the modeled robot. Payload has no physical envelope.')
+    st.form_submit_button('Optimize for walking',on_click=optimize_goals,type='primary',width='stretch')
+st.caption('Automatically chooses link lengths, hip/knee pose, step length, foot lift and slow timing. Payload, component masses, hardware and weight budget remain the constraints set in Advanced inputs.')
 if st.session_state.get('goal_error'): st.error(st.session_state.goal_error)
 report=st.session_state.get('goal_report')
 if report:
     if report['applied'] is None:
-        st.warning('No design passed these goals. Your existing model is unchanged. Try a lower payload, shorter step, or a different height.')
+        st.warning('No sampled design passed the walking-motion checks at this height. Your model is unchanged. Try another height or review the hardware and mass assumptions in Advanced inputs.')
         with st.expander('Why no design passed'):
             st.dataframe([{'Constraint':k,'Candidates rejected':v} for k,v in report['failures'].items()],hide_index=True)
     else:
         best=report['chosen']
-        st.success(f"Design calculated · {report['passing']} of {report['tested']} candidates passed the screening checks.")
+        st.success("Walking-motion candidate found · full two-cycle path checked. Real-world balance is not validated.")
         cols=st.columns(3)
         cols[0].metric('Thigh length',format_length(best['config']['L_thigh'],unit))
         cols[1].metric('Shin length',format_length(best['config']['L_shin'],unit))
         cols[2].metric('Modeled mass',f"{best['mass']:.0f} g")
         if st.session_state.cfg!=report['applied']:
             st.info('Advanced inputs have changed since optimization. Optimize again to update this result.')
+        if report.get('walking_priority'):
+            st.write(f"Chosen automatically: step {format_length(best['config']['reach'],unit)}, foot clearance {format_length(best['config']['lift'],unit)}, cycle {best['period']:.1f} s. Walking preview is ready; open that tab and press Play.")
+            st.caption(f"{report['tested']} geometry/motion combinations screened. The selected path contains {len(report['motion']['frames'])} sampled poses, with {best['knee_margin']:.1f}° minimum knee-bend margin.")
         st.button('Undo optimized design',on_click=undo_design,key='undo_design')
     with st.expander('How the dashboard chooses your design'):
-        st.write('1. Add your payload to the mass model. Try 18 combinations of thigh/shin proportion (45:55, 50:50, 55:45) and knee bend (25° to 75°). Solve link lengths to match your overall height within 1 mm and place the feet on the ground.')
-        st.write('2. Check the height, weight budget, joint limits, approximate servo packaging and requested reach. Test a full walking cycle at 17 time samples for reach and ground clearance.')
-        st.write('3. Estimate joint torque from gravity plus a vertical load equal to the entire robot weight on each stance leg. Adding the absolute moments gives a conservative screening load case. Choose the passing candidate with the lowest peak demand against the configured servo allowance.')
-        st.write('The knee servo is placed at the knee; printed-link centers of mass are estimated at mid-link. Component masses, foot radius, platform dimensions and measured offsets stay fixed. Update these assumptions from your CAD in Advanced inputs. The search finds the best of 18 candidates, not a global optimum.')
-        st.caption('The load case does not solve dynamic equilibrium, acceleration, traction, lateral balance or servo heating. A passing design and the walking animation do not establish that the robot can walk unsupported.')
+        st.write('1. Match your total height with symmetric link lengths and a bent-knee starting pose. Keep your actual payload, mass estimates, servo ratings and working allowance. Try 18 leg proportion/pose combinations for each of three small step-and-lift profiles (54 combinations).')
+        st.write('2. Screen packaging, reach, ground clearance and gravity loading. Validate a full two-cycle path at 81 sampled poses, with at least 10° of knee bend to avoid a nearly straight knee. Check up to five shortlisted geometries per motion profile.')
+        st.write('3. Choose low screening torque rather than speed. Start with a 4 s cycle and 70% stance; slow down further if sampled joint speed exceeds an assumed 45°/s limit. That speed limit is a planning assumption, not a measured servo guarantee. There is no zero-length-step solution.')
+        st.write('Step lengths are 3%, 5% or 8% of height (limited to 3–20 mm); corresponding lift is 2.5%, 3.5% or 4.5% of height (limited to 3–10 mm), for assumed level ground. Knee-servo and printed-link mass locations follow the generated lengths; component masses stay fixed.')
+        st.caption('This is a kinematic and approximate gravity-load search. Slower motion does not establish balance: rounded contacts and four pitch joints still require dynamic control and physical testing. Lateral weight transfer, acceleration, friction, heating and structural strength are not solved. No unsupported-walking claim is made.')
 
 
 c=st.session_state.cfg
@@ -338,6 +335,8 @@ with cad:
         st.info('The export has been simplified. Finalize again to replace the previous parameter list.')
         snapshot=None
     if snapshot:
+        snapshot=with_units(snapshot,unit)
+        st.session_state.cad_snapshot=snapshot
         st.success(f"CAD snapshot {snapshot['revision']} · {snapshot['created']}")
         if c!=snapshot['config'] or cad_dimension_values()!=snapshot['dimensions']:
             st.warning('The current model has changed. Downloads still contain the frozen snapshot above. Finalize again to export the new dimensions.')
@@ -349,7 +348,7 @@ with cad:
             st.download_button('Download CAD package (.zip)',bundle(snapshot),
                                f"negentropy_cad_{snapshot['revision']}.zip",'application/zip',
                                key='download_cad_bundle',width='stretch')
-        st.caption('The ZIP includes the equations, setup guide, parameter map, dashboard configuration and CAD dimensions. All equations use explicit mm, including when you display inches. Pose, offsets and servo dimensions are excluded.')
+        st.caption(f'The equations text and parameter map use {unit}, following Length units on the left. Switching units converts the same frozen dimensions immediately. The restore JSON files retain mm. Pose, offsets and servo dimensions are excluded.')
         with st.expander('Preview the Notepad file'):
             st.code(snapshot['text'],language=None)
         with st.expander('Parameter names and physical references'):
@@ -643,7 +642,7 @@ with motion:
     st.subheader('Rounded-foot walking preview')
     st.warning('Kinematic preview, not a prediction of real-world walking. Body motion is prescribed; there is no dynamic balance controller, friction/impact model, or powered lateral weight shift. The real robot may fall even when all preview frames are reachable.')
     st.write('The pelvis advances at constant height and speed. Legs alternate half a cycle apart. Each nub follows no-slip sagittal rolling during stance, then a smooth lifted path to its next touchdown. Both legs use your current lengths, radii, offsets and limits; the animation generates new joint angles without changing your saved pose.')
-    st.caption(f"Each alternating step advances the body by {dimension(c['reach'])}; each foot repeats after a stride of {dimension(2*c['reach'])}. Peak swing clearance is {dimension(c['lift'])}. Change Forward reach and Desired foot-reference lift under Design inputs → Requirements. Those values specify motion targets, not guaranteed walking capability.")
+    st.caption(f"Each alternating step advances the body by {dimension(c['reach'])}; each foot repeats after a stride of {dimension(2*c['reach'])}. Peak swing clearance is {dimension(c['lift'])}. The height-only optimizer selects these targets; manual overrides are under Advanced inputs → Requirements. Those values specify motion targets, not guaranteed walking capability.")
     def sync_motion(key,kind):
         other='n' if kind=='s' else 's'
         st.session_state[key+'__'+other]=st.session_state[key+'__'+kind]
@@ -655,10 +654,11 @@ with motion:
         a.slider(label,min_value=lo,max_value=hi,step=step,key=key+'__s',on_change=sync_motion,args=(key,'s'))
         v=b.number_input(label+' — numeric',min_value=lo,max_value=hi,step=step,key=key+'__n',on_change=sync_motion,args=(key,'n'),label_visibility='collapsed')
         return v
-    period=motion_input('motion_period','Full cycle duration (s)',.4,10.,1.6,.05)
-    duty=motion_input('motion_duty','Stance fraction of each leg cycle',.5,.8,.6,.01)
-    cycles=st.selectbox('Cycles to preview',[1,2,3,4],index=1,key='motion_cycles')
-    st.caption('Assumed preview defaults: 1.6 s cycle, 60% stance, two cycles. More than 50% stance creates double-contact intervals. Timing controls only the animation and calculated kinematic speeds; actuator response is not simulated.')
+    with st.expander('Advanced timing overrides'):
+        period=motion_input('motion_period','Full cycle duration (s)',.4,10.,1.6,.05)
+        duty=motion_input('motion_duty','Stance fraction of each leg cycle',.5,.8,.6,.01)
+        cycles=st.selectbox('Cycles to preview',[1,2,3,4],index=1,key='motion_cycles')
+    st.caption('Timing is selected automatically after height optimization. Manual timing changes affect the preview; they do not establish dynamic balance or simulate servo response.')
     signature=(dumps(c),period,duty,cycles) if result else None
     if st.button('Build walking preview',key='build_preview',disabled=result is None or c['foot_model']!='Rounded nub'):
         with st.spinner('Solving rounded-foot rolling and swing trajectories…'):
@@ -727,4 +727,3 @@ with guide:
     st.latex(r"c_2=\frac{x^2+z^2-L_1^2-L_2^2}{2L_1L_2},\quad q_2=\pm\arccos c_2,\quad q_1=\mathrm{atan2}(x,-z)-\mathrm{atan2}(L_2\sin q_2,L_1+L_2\cos q_2)")
     st.latex(r"p_{CoM}=\frac{\sum_i m_i(o_{body(i)}+R_{body(i)}p_{i,local})}{\sum_i m_i}")
     st.markdown("Sources: [Modern Robotics · two-link IK](https://modernrobotics.northwestern.edu/nu-gm-book-resource/inverse-kinematics-of-open-chains/), [MIT · legged contact](https://underactuated.mit.edu/humanoids.html), [TowerPro · MG996R specifications](https://towerpro.com.tw/product/mg996R/). Full assumptions, coordinate definitions and limitations are in `SOURCES_AND_MODEL.md` beside the code.")
-

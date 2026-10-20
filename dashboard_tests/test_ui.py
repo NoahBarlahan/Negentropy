@@ -6,13 +6,13 @@ from config import defaults,dumps
 APP=Path(__file__).resolve().parents[1]/'app.py'
 
 
-def test_cad_finalize_download_is_mm_and_snapshot_stays_frozen_after_edit():
+def test_cad_export_follows_units_and_snapshot_stays_frozen_after_edit():
     app=AppTest.from_file(str(APP),default_timeout=60).run()
     app.selectbox(key='length_unit').select('in').run()
     app.button(key='finalize_cad').click().run()
     assert not app.exception
     snapshot=app.session_state['cad_snapshot']
-    assert '"ThighLength_L" = 65 mm' in snapshot['text']
+    assert '"ThighLength_L" = 2.55905512 in' in snapshot['text']
     assert snapshot['config']==defaults()
     assert len(app.get('download_button'))>=3
     app.number_input(key='L_thigh__n').set_value(3.).run()
@@ -21,35 +21,45 @@ def test_cad_finalize_download_is_mm_and_snapshot_stays_frozen_after_edit():
     assert any('Downloads still contain the frozen snapshot' in w.value for w in app.warning)
     app.button(key='finalize_cad').click().run()
     assert app.session_state['cad_snapshot']['config']['L_thigh']==pytest.approx(76.2)
-    assert '"ThighLength_L" = 76.2 mm' in app.session_state['cad_snapshot']['text']
+    assert '"ThighLength_L" = 3 in' in app.session_state['cad_snapshot']['text']
     assert app.session_state['cad_snapshot']['revision']!=snapshot['revision']
     app.number_input(key='cad_dimension_ThighWidth').set_value(1.).run()
     app.number_input(key='cad_dimension_WaistHeight').set_value(2.).run()
     app.button(key='finalize_cad').click().run()
     assert not app.exception
-    assert '"ThighWidth" = 25.4 mm' in app.session_state['cad_snapshot']['text']
-    assert '"WaistHeight" = 50.8 mm' in app.session_state['cad_snapshot']['text']
+    assert '"ThighWidth" = 1 in' in app.session_state['cad_snapshot']['text']
+    assert '"WaistHeight" = 2 in' in app.session_state['cad_snapshot']['text']
     assert app.session_state['cfg']['platform_t']==4
     app.selectbox(key='length_unit').select('mm').run()
     assert not app.exception
     assert app.number_input(key='cad_dimension_ThighWidth').value==pytest.approx(25.4)
     assert app.number_input(key='cad_dimension_WaistHeight').value==pytest.approx(50.8)
+    assert '"ThighWidth" = 25.4 mm' in app.session_state['cad_snapshot']['text']
+    assert '"ThighLength_L" = 76.2 mm' in app.session_state['cad_snapshot']['text']
+    app.selectbox(key='length_unit').select('in').run()
+    assert '"ThighLength_L" = 3 in' in app.session_state['cad_snapshot']['text']
+    assert app.session_state['cfg']['L_thigh']==pytest.approx(76.2)
 
 
 def test_main_goals_optimize_in_inches_and_undo():
     app=AppTest.from_file(str(APP),default_timeout=60).run()
+    assert not any(n.key in ('goal_payload','goal_step','goal_clearance','goal_mass_limit') for n in app.number_input)
+    app.number_input(key='payload_mass__n').set_value(100.).run()
     original=dict(app.session_state['cfg'])
     app.selectbox(key='length_unit').select('in').run()
     assert app.number_input(key='goal_height').value==pytest.approx(157.1600407/25.4)
     app.number_input(key='goal_height').set_value(7.)
-    app.number_input(key='goal_payload').set_value(100.)
-    next(b for b in app.button if b.label=='Optimize my design').click().run()
+    next(b for b in app.button if b.label=='Optimize for walking').click().run()
     assert not app.exception
     report=app.session_state['goal_report']
     assert report['applied'] is not None
     assert app.session_state['cfg']['payload_mass']==100
     from model import build
     assert build(app.session_state['cfg'])['height']*1000==pytest.approx(177.8,abs=.01)
+    assert app.session_state['motion_result']['complete']
+    assert len(app.session_state['motion_result']['frames'])==81
+    assert app.number_input(key='motion_period__n').value>=4
+    assert len(app.get('iframe'))==1
     app.button(key='undo_design').click().run()
     assert not app.exception
     assert app.session_state['cfg']==original
